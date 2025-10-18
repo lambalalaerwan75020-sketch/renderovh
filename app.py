@@ -772,7 +772,6 @@ def home():
     ovh_line=Config.OVH_LINE_NUMBER,
     webhook_url=request.url_root.rstrip('/')
     )
-
 @app.route('/upload', methods=['POST'])
 def upload_file():
     try:
@@ -784,31 +783,73 @@ def upload_file():
             return jsonify({"error": "Aucun fichier"}), 400
         
         filename = secure_filename(file.filename)
+        if not filename.endswith('.csv'):
+            return jsonify({"error": "CSV uniquement"}), 400
         
-        if filename.endswith('.txt'):
-            content = file.read().decode('utf-8-sig')
-            nb = load_clients_from_pipe_file(content)
-            upload_stats["filename"] = filename
-            return jsonify({
-                "status": "success",
-                "clients": nb,
-                "message": f"{nb} clients chargés"
-            })
-        else:
-            return jsonify({"error": "Format .txt uniquement"}), 400
-            
+        content = file.read().decode('utf-8-sig')
+        nb = load_clients_from_csv(content)
+        
+        return jsonify({"status": "success", "clients": nb})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/clients')
 def clients():
-    search = request.args.get('search', '')
+    return jsonify({
+        "total": len(clients_database),
+        "clients": list(clients_database.values())[:20]
+    })
+
+@app.route('/test-telegram')
+def test_telegram():
+    if not telegram_service:
+        return jsonify({"error": "Non configuré"}), 400
     
-    if search:
-        search_lower = search.lower()
-        filtered = {k: v for k, v in clients_database.items() 
-                   if search_lower in f"{v['nom']} {v['prenom']} {v['telephone']}".lower()}
+    msg = f"🚂 Test Railway - {datetime.now().strftime('%H:%M:%S')}"
+    result = telegram_service.send_message(msg)
+    return jsonify({"status": "success" if result else "error"})
+
+@app.route('/fix-webhook')
+def fix_webhook():
+    if not Config.TELEGRAM_TOKEN:
+        return jsonify({"error": "Token manquant"}), 400
+    
+    try:
+        webhook_url = request.url_root + "webhook/telegram"
+        url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/setWebhook"
+        data = {"url": webhook_url, "drop_pending_updates": True}
+        response = requests.post(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            return jsonify({
+                "status": "success",
+                "webhook_url": webhook_url,
+                "message": "Webhook configuré"
+            })
+        return jsonify({"error": response.text}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "healthy",
+        "platform": "Railway.app",
+        "chat_id": Config.CHAT_ID,
+        "config_valid": config_valid,
+        "clients": upload_stats["total_clients"],
+        "timestamp": datetime.now().isoformat()
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    logger.info("🚂 Démarrage Railway")
+    logger.info(f"📱 Chat ID: {Config.CHAT_ID}")
+    
+    is_valid, missing = check_required_config()
+    if is_valid:
+        logger.info("✅ Config OK")
     else:
-        filtered = dict(list(clients_database.items())[:50])
+        logger.warning(f"⚠️ Manquant: {missing}")
     
-    
+    app.run(host='0.0.0.0', port=port, debug=False)
