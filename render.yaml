@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: webhook-ovh-telegram
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: CHAT_ID
+        value: -4928923400
+      - key: OVH_LINE_NUMBER
+        value: 0033185093039
+      - key: RENDER
+        value: true
+    healthCheckPath: /ping
