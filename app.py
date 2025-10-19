@@ -117,13 +117,52 @@ def rate_limit(calls_per_minute=30):
 
 class IBANDetector:
     def __init__(self):
-        self.local_banks = {
-            '10907': 'BNP Paribas', '30004': 'BNP Paribas',
-            '30003': 'Société Générale', '30002': 'Crédit Agricole',
-            '20041': 'La Banque Postale', '30056': 'BRED',
-            '10278': 'Crédit Mutuel', '10906': 'CIC',
-            '16798': 'ING Direct', '12548': 'Boursorama',
-            '30027': 'Crédit Coopératif', '17515': 'Monabanq', '18206': 'N26'
+        # Codes banques spécifiques Crédit Agricole
+        self.credit_agricole_codes = {
+            '13906': 'Crédit Agricole Centre-est',
+            '14706': 'Crédit Agricole Atlantique Vendée',
+            '18706': 'Crédit Agricole Ile-de-France',
+            '16906': 'Crédit Agricole Pyrénées Gascogne',
+            '18206': 'Crédit Agricole Nord-est',
+            '11706': 'Crédit Agricole Charente Périgord',
+            '10206': 'Crédit Agricole Nord de France',
+            '13306': 'Crédit Agricole Aquitaine',
+            '13606': 'Crédit Agricole Centre Ouest',
+            '14506': 'Crédit Agricole Centre Loire',
+            '16606': 'Crédit Agricole Normandie-Seine',
+            '16906': 'Crédit Agricole Toulouse 31',
+            '17206': 'Crédit Agricole Alsace Vosges',
+            '17906': 'Crédit Agricole Anjou Maine',
+            '12406': 'Crédit Agricole Charente-Maritime',
+            '12906': 'Crédit Agricole Finistère',
+            '12206': 'Crédit Agricole Morbihan',
+            '14806': 'Crédit Agricole Languedoc',
+            '17106': 'Crédit Agricole Loire Haute-Loire',
+            '11206': 'Crédit Agricole Brie Picardie',
+            '13106': 'Crédit Agricole Alpes Provence',
+            '14406': 'Crédit Agricole Ille-et-Vilaine',
+            '16106': 'Crédit Agricole Deux-Sèvres',
+            '16706': 'Crédit Agricole Sud Rhône Alpes',
+            '17306': 'Crédit Agricole Sud Méditerranée',
+            '18106': 'Crédit Agricole Touraine Poitou',
+            '19106': 'Crédit Agricole Centre France',
+            '12506': 'Crédit Agricole Loire Océan',
+            '13206': 'Crédit Agricole Midi-Pyrénées',
+            '14206': 'Crédit Agricole Normandie',
+            '15206': 'Crédit Agricole Savoie Mont Blanc',
+            '16206': 'Crédit Agricole Franche-Comté',
+            '17606': 'Crédit Agricole Lorraine',
+            '18406': 'Crédit Agricole Val de France',
+            '19406': 'Crédit Agricole Provence Côte d\'Azur'
+        }
+        
+        # Autres banques pour référence
+        self.other_banks = {
+            '30003': 'Société Générale',
+            '30056': 'BRED',
+            '10278': 'Crédit Mutuel',
+            '10906': 'CIC',
+            '30027': 'Crédit Coopératif'
         }
     
     def clean_iban(self, iban):
@@ -131,26 +170,64 @@ class IBANDetector:
             return ""
         return iban.replace(' ', '').replace('-', '').upper()
     
-    def detect_local(self, iban_clean):
-        """Détection locale uniquement - RAPIDE"""
+    def detect_credit_agricole(self, iban_clean):
+        """Détection spécifique Crédit Agricole"""
         if not iban_clean.startswith('FR'):
             return "Banque étrangère"
+        
         if len(iban_clean) < 14:
             return "IBAN invalide"
+        
         try:
+            # Extraire le code banque (positions 4-9 dans l'IBAN)
             code_banque = iban_clean[4:9]
-            return self.local_banks.get(code_banque, f"Banque française ({code_banque})")
-        except:
+            
+            # Vérifier si c'est un code Crédit Agricole
+            if code_banque in self.credit_agricole_codes:
+                return f"🏛️ {self.credit_agricole_codes[code_banque]}"
+            else:
+                # Vérifier si c'est une autre banque
+                if code_banque in self.other_banks:
+                    return f"🏦 {self.other_banks[code_banque]}"
+                else:
+                    return f"🏦 Banque française ({code_banque})"
+                    
+        except Exception as e:
+            logger.error(f"Erreur détection banque: {str(e)}")
             return "IBAN invalide"
     
     def detect_bank(self, iban):
-        """Point d'entrée principal - LOCAL ONLY pour performance"""
+        """Point d'entrée principal - OPTIMISÉ Crédit Agricole"""
         if not iban:
             return "N/A"
+        
         iban_clean = self.clean_iban(iban)
         if not iban_clean:
             return "N/A"
-        return self.detect_local(iban_clean)
+        
+        return self.detect_credit_agricole(iban_clean)
+    
+    def extract_bank_stats(self, clients_data):
+        """Extraire les statistiques des banques"""
+        bank_stats = {}
+        total_clients = len(clients_data)
+        
+        for client in clients_data.values():
+            iban = client.get('iban', '')
+            if iban:
+                iban_clean = self.clean_iban(iban)
+                bank_name = self.detect_credit_agricole(iban_clean)
+                
+                if bank_name not in bank_stats:
+                    bank_stats[bank_name] = 0
+                bank_stats[bank_name] += 1
+        
+        return {
+            'total_clients': total_clients,
+            'bank_stats': bank_stats,
+            'credit_agricole_count': sum(count for bank, count in bank_stats.items() if 'Crédit Agricole' in bank),
+            'other_banks_count': sum(count for bank, count in bank_stats.items() if 'Crédit Agricole' not in bank)
+        }
 
 iban_detector = IBANDetector()
 
@@ -332,10 +409,9 @@ def load_clients_from_pipe_file(file_content):
                     ville = ville_code
                     code_postal = ''
                 
-                # Détection banque LOCALE uniquement (pas d'API = instantané)
+                # Détection banque OPTIMISÉE Crédit Agricole
                 if iban:
-                    iban_clean = iban_detector.clean_iban(iban)
-                    banque = f"🏦 {iban_detector.detect_local(iban_clean)}"
+                    banque = iban_detector.detect_bank(iban)
                 else:
                     banque = 'N/A'
                 
@@ -409,8 +485,13 @@ def process_telegram_command(message_text, chat_id):
             return {"status": "ok", "command": "iban"}
             
         elif message_text.startswith('/stats'):
-            msg = f"""📊 <b>STATS</b>
-👥 Clients: {upload_stats['total_clients']}
+            bank_stats = iban_detector.extract_bank_stats(clients_database)
+            msg = f"""📊 <b>STATS BANQUES</b>
+
+👥 Clients totaux: {bank_stats['total_clients']}
+🏛️ Crédit Agricole: {bank_stats['credit_agricole_count']}
+🏦 Autres banques: {bank_stats['other_banks_count']}
+
 📁 Upload: {upload_stats['last_upload'] or 'Aucun'}
 📞 Ligne: {Config.OVH_LINE_NUMBER}
 🌐 Plateforme: Render.com ⚡ OPTIMISÉ"""
@@ -481,8 +562,8 @@ def ping():
 
 @app.route('/')
 def home():
-    auto_detected = len([c for c in clients_database.values() 
-                        if c['banque'] not in ['N/A', ''] and c['iban']])
+    bank_stats = iban_detector.extract_bank_stats(clients_database)
+    auto_detected = bank_stats['credit_agricole_count']
     
     return render_template_string("""
 <!DOCTYPE html>
@@ -523,6 +604,7 @@ def home():
             margin: 5px;
         }
         .badge.success { background: rgba(76, 175, 80, 0.9); }
+        .badge.ca { background: rgba(255, 193, 7, 0.9); color: black; }
         .content { padding: 40px; }
         .alert {
             padding: 20px;
@@ -533,6 +615,7 @@ def home():
         .alert-success { background: #d4edda; border-color: #28a745; color: #155724; }
         .alert-error { background: #f8d7da; border-color: #dc3545; color: #721c24; }
         .alert-info { background: #d1ecf1; border-color: #0dcaf0; color: #0c5460; }
+        .alert-ca { background: #fff3cd; border-color: #ffc107; color: #856404; }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -546,6 +629,10 @@ def home():
             border-radius: 12px;
             text-align: center;
             box-shadow: 0 5px 15px rgba(102,126,234,0.3);
+        }
+        .stat-card.ca {
+            background: linear-gradient(135deg, #ffc107 0%, #ff9800 100%);
+            color: black;
         }
         .stat-card h3 { font-size: 1em; margin-bottom: 15px; opacity: 0.9; }
         .stat-card .value { font-size: 2.5em; font-weight: bold; }
@@ -563,6 +650,7 @@ def home():
         }
         .btn-primary { background: #667eea; }
         .btn-success { background: #28a745; }
+        .btn-ca { background: #ffc107; color: black; }
         .btn-danger { background: #dc3545; }
         .btn:hover { transform: translateY(-2px); opacity: 0.9; }
         .upload-section {
@@ -612,6 +700,24 @@ def home():
             color: white;
             font-weight: bold;
         }
+        .bank-stats {
+            background: #fff3cd;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border-left: 5px solid #ffc107;
+        }
+        .bank-list {
+            max-height: 300px;
+            overflow-y: auto;
+            margin: 15px 0;
+        }
+        .bank-item {
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+        }
     </style>
 </head>
 <body>
@@ -620,7 +726,7 @@ def home():
             <h1>⚡ Webhook Render OPTIMISÉ</h1>
             <div class="badge">Chat ID: {{ chat_id }}</div>
             <div class="badge success">✅ Keep-Alive Actif</div>
-            <div class="badge success">⚡ ULTRA-RAPIDE</div>
+            <div class="badge ca">🏛️ CRÉDIT AGRICOLE</div>
         </div>
         
         <div class="content">
@@ -640,12 +746,12 @@ def home():
             </div>
             {% endif %}
             
-            <div class="alert alert-info">
-                <strong>⚡ OPTIMISATIONS ACTIVES</strong><br>
-                ✅ Détection banque locale instantanée<br>
-                ✅ Pas d'appels API externes pendant le chargement<br>
-                ✅ Traitement optimisé pour 500+ clients<br>
-                ✅ Temps de chargement: < 1 seconde
+            <div class="alert alert-ca">
+                <strong>🏛️ SPÉCIALISATION CRÉDIT AGRICOLE</strong><br>
+                ✅ Détection optimisée des agences Crédit Agricole<br>
+                ✅ 30+ codes banques régionaux reconnus<br>
+                ✅ Statistiques détaillées par région<br>
+                ⚡ Temps de chargement: < 1 seconde
             </div>
             
             <div class="stats-grid">
@@ -653,15 +759,33 @@ def home():
                     <h3>👥 Clients chargés</h3>
                     <div class="value">{{ total_clients }}</div>
                 </div>
+                <div class="stat-card ca">
+                    <h3>🏛️ Crédit Agricole</h3>
+                    <div class="value">{{ ca_count }}</div>
+                </div>
                 <div class="stat-card">
-                    <h3>🏦 Banques détectées</h3>
-                    <div class="value">{{ auto_detected }}</div>
+                    <h3>🏦 Autres banques</h3>
+                    <div class="value">{{ other_count }}</div>
                 </div>
                 <div class="stat-card">
                     <h3>📁 Dernier upload</h3>
                     <div class="value" style="font-size:1.2em;">{{ last_upload or 'Aucun' }}</div>
                 </div>
             </div>
+            
+            {% if bank_stats %}
+            <div class="bank-stats">
+                <h3>📊 Répartition par banque</h3>
+                <div class="bank-list">
+                    {% for bank, count in bank_stats.items() %}
+                    <div class="bank-item">
+                        <span>{{ bank }}</span>
+                        <strong>{{ count }}</strong>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
             
             <div class="upload-section">
                 <h2>📂 Upload fichier clients</h2>
@@ -688,6 +812,7 @@ def home():
             <h3>🔧 Actions</h3>
             <div style="margin: 20px 0;">
                 <a href="/clients" class="btn btn-primary">👥 Clients</a>
+                <a href="/bank-stats" class="btn btn-ca">🏛️ Stats CA</a>
                 <a href="/test-telegram" class="btn btn-success">📧 Test</a>
                 <a href="/health" class="btn btn-primary">🔍 Status</a>
                 <a href="/fix-webhook" class="btn btn-success">🔧 Webhook</a>
@@ -703,7 +828,7 @@ def home():
                 <h3>📱 Commandes Telegram</h3>
                 <code>/numero 0669290606</code> - Fiche client<br>
                 <code>/iban FR76...</code> - Détection banque<br>
-                <code>/stats</code> - Statistiques
+                <code>/stats</code> - Statistiques Crédit Agricole
             </div>
         </div>
     </div>
@@ -748,7 +873,9 @@ def home():
     """,
     config_valid=config_valid,
     total_clients=upload_stats["total_clients"],
-    auto_detected=auto_detected,
+    ca_count=bank_stats['credit_agricole_count'],
+    other_count=bank_stats['other_banks_count'],
+    bank_stats=bank_stats['bank_stats'],
     last_upload=upload_stats.get("last_upload"),
     chat_id=Config.CHAT_ID,
     ovh_line=Config.OVH_LINE_NUMBER,
@@ -795,12 +922,33 @@ def clients():
         "message": "Affichage des 20 premiers clients"
     })
 
+@app.route('/bank-stats')
+def bank_stats():
+    """Statistiques détaillées Crédit Agricole"""
+    stats = iban_detector.extract_bank_stats(clients_database)
+    
+    return jsonify({
+        "status": "success",
+        "platform": "Render.com ⚡ OPTIMISÉ",
+        "total_clients": stats['total_clients'],
+        "credit_agricole": {
+            "total": stats['credit_agricole_count'],
+            "percentage": round((stats['credit_agricole_count'] / stats['total_clients'] * 100), 2) if stats['total_clients'] > 0 else 0
+        },
+        "other_banks": {
+            "total": stats['other_banks_count'],
+            "percentage": round((stats['other_banks_count'] / stats['total_clients'] * 100), 2) if stats['total_clients'] > 0 else 0
+        },
+        "detailed_stats": stats['bank_stats'],
+        "timestamp": datetime.now().isoformat()
+    })
+
 @app.route('/test-telegram')
 def test_telegram():
     if not telegram_service:
         return jsonify({"error": "Non configuré"}), 400
     
-    msg = f"⚡ Test Render.com OPTIMISÉ - {datetime.now().strftime('%H:%M:%S')}\n✅ Chargement 500+ clients en < 1s"
+    msg = f"⚡ Test Render.com OPTIMISÉ - {datetime.now().strftime('%H:%M:%S')}\n✅ Chargement 500+ clients en < 1s\n🏛️ Spécialisation Crédit Agricole"
     result = telegram_service.send_message(msg)
     return jsonify({"status": "success" if result else "error"})
 
@@ -827,15 +975,20 @@ def fix_webhook():
 
 @app.route('/health')
 def health():
+    bank_stats = iban_detector.extract_bank_stats(clients_database)
+    
     return jsonify({
         "status": "healthy",
         "platform": "Render.com ⚡ OPTIMISÉ",
         "chat_id": Config.CHAT_ID,
         "config_valid": config_valid,
         "clients": upload_stats["total_clients"],
+        "credit_agricole_clients": bank_stats['credit_agricole_count'],
+        "other_banks_clients": bank_stats['other_banks_count'],
         "keep_alive": "active",
         "optimizations": [
-            "Détection banque locale instantanée",
+            "Détection Crédit Agricole optimisée",
+            "30+ codes banques régionaux reconnus",
             "Pas d'appels API externes",
             "Traitement optimisé 500+ clients",
             "Temps chargement: < 1 seconde"
@@ -872,8 +1025,14 @@ def stats():
     top_banks = sorted(banks_count.items(), key=lambda x: x[1], reverse=True)[:10]
     top_cities = sorted(cities_count.items(), key=lambda x: x[1], reverse=True)[:10]
     
+    bank_stats = iban_detector.extract_bank_stats(clients_database)
+    
     return jsonify({
         "total_clients": len(clients_database),
+        "credit_agricole_stats": {
+            "total": bank_stats['credit_agricole_count'],
+            "percentage": round((bank_stats['credit_agricole_count'] / len(clients_database) * 100), 2) if clients_database else 0
+        },
         "last_upload": upload_stats.get("last_upload"),
         "filename": upload_stats.get("filename"),
         "top_banks": [{"bank": b[0], "count": b[1]} for b in top_banks],
@@ -912,6 +1071,7 @@ def not_found(error):
             "/webhook/telegram",
             "/upload",
             "/clients",
+            "/bank-stats",
             "/search/<phone>",
             "/stats",
             "/test-telegram",
@@ -937,14 +1097,15 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     logger.info("=" * 60)
-    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION OPTIMISÉE")
+    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION CRÉDIT AGRICOLE")
     logger.info("=" * 60)
     logger.info(f"📱 Chat ID: {Config.CHAT_ID}")
     logger.info(f"📞 Ligne OVH: {Config.OVH_LINE_NUMBER}")
     logger.info(f"🔄 Keep-alive: Actif")
+    logger.info(f"🏛️ Spécialisation: CRÉDIT AGRICOLE")
     logger.info(f"⚡ Optimisations: ACTIVES")
-    logger.info(f"   • Détection banque locale instantanée")
-    logger.info(f"   • Pas d'appels API externes")
+    logger.info(f"   • Détection 30+ codes banques CA")
+    logger.info(f"   • Statistiques détaillées par région")
     logger.info(f"   • Chargement 500+ clients en < 1s")
     logger.info("=" * 60)
     
@@ -957,4 +1118,4 @@ if __name__ == '__main__':
     logger.info(f"🚀 Démarrage sur le port {port}")
     logger.info("=" * 60)
     
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', portport, debug=False)
