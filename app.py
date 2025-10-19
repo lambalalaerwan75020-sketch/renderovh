@@ -96,66 +96,6 @@ class SimpleCache:
 
 cache = SimpleCache()
 
-
-# --- REDIS-LIKE STORE (use REDIS if REDIS_URL provided, otherwise process-local) ---
-USE_REDIS = False
-redis_client = None
-try:
-    import redis
-    REDIS_URL = os.environ.get("REDIS_URL") or os.environ.get("REDIS", "")
-    if REDIS_URL:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        try:
-            redis_client.ping()
-            USE_REDIS = True
-        except Exception:
-            redis_client = None
-            USE_REDIS = False
-except Exception:
-    redis_client = None
-    USE_REDIS = False
-
-class ProcessStore:
-    def __init__(self):
-        self._store = {}
-        self._ts = {}
-    def set(self, key, value):
-        self._store[key] = value
-        self._ts[key] = time.time()
-    def get(self, key):
-        return self._store.get(key)
-    def delete(self, key):
-        if key in self._store:
-            del self._store[key]
-            del self._ts[key]
-    def keys(self, pattern="*"):
-        return list(self._store.keys())
-
-process_store = ProcessStore()
-
-def store_set(key, value):
-    val = json.dumps(value, ensure_ascii=False)
-    if USE_REDIS and redis_client:
-        redis_client.set(key, val)
-    else:
-        process_store.set(key, val)
-
-def store_get(key):
-    if USE_REDIS and redis_client:
-        v = redis_client.get(key)
-        return json.loads(v) if v else None
-    else:
-        v = process_store.get(key)
-        return json.loads(v) if v else None
-
-def store_delete(key):
-    if USE_REDIS and redis_client:
-        redis_client.delete(key)
-    else:
-        process_store.delete(key)
-# --- end store ---
-
-
 def rate_limit(calls_per_minute=30):
     def decorator(func):
         calls = []
@@ -177,51 +117,15 @@ def rate_limit(calls_per_minute=30):
 
 class IBANDetector:
     def __init__(self):
-        self.local_banks = { 
+        self.local_banks = {
             '10907': 'BNP Paribas', '30004': 'BNP Paribas',
-            '30003': 'Société Générale', '30002': 'Crédit Agricole',
-            '20041': 'La Banque Postale', '30056': 'BRED',
+            '30003': 'Société Générale', '30002': 'Crédit Agricole','20041': 'La Banque Postale', '30056': 'BRED',
             '10278': 'Crédit Mutuel', '10906': 'CIC',
             '16798': 'ING Direct', '12548': 'Boursorama',
-            '30027': 'Crédit Coopératif', '17515': 'Monabanq', '18206': 'N26',
-
-            # --- AJOUT COMPLET Crédit Agricole ---
-            '13906': 'Crédit Agricole Centre-est',
-            '14706': 'Crédit Agricole Atlantique Vendée',
-            '18706': 'Crédit Agricole Ile-de-France',
-            '16906': 'Crédit Agricole Toulouse 31',
-            '18206': 'Crédit Agricole Nord-est',
-            '11706': 'Crédit Agricole Charente Périgord',
-            '10206': 'Crédit Agricole Nord de France',
-            '13306': 'Crédit Agricole Aquitaine',
-            '13606': 'Crédit Agricole Centre Ouest',
-            '14506': 'Crédit Agricole Centre Loire',
-            '16606': 'Crédit Agricole Normandie-Seine',
-            '17206': 'Crédit Agricole Alsace Vosges',
-            '17906': 'Crédit Agricole Anjou Maine',
-            '12406': 'Crédit Agricole Charente-Maritime',
-            '12906': 'Crédit Agricole Finistère',
-            '12206': 'Crédit Agricole Morbihan',
-            '14806': 'Crédit Agricole Languedoc',
-            '17106': 'Crédit Agricole Loire Haute-Loire',
-            '11206': 'Crédit Agricole Brie Picardie',
-            '13106': 'Crédit Agricole Alpes Provence',
-            '14406': 'Crédit Agricole Ille-et-Vilaine',
-            '16106': 'Crédit Agricole Deux-Sèvres',
-            '16706': 'Crédit Agricole Sud Rhône Alpes',
-            '17306': 'Crédit Agricole Sud Méditerranée',
-            '18106': 'Crédit Agricole Touraine Poitou',
-            '19106': 'Crédit Agricole Centre France',
-            '12506': 'Crédit Agricole Loire Océan',
-            '13206': 'Crédit Agricole Midi-Pyrénées',
-            '14206': 'Crédit Agricole Normandie',
-            '15206': 'Crédit Agricole Savoie Mont Blanc',
-            '16206': 'Crédit Agricole Franche-Comté',
-            '17606': 'Crédit Agricole Lorraine',
-            '18406': 'Crédit Agricole Val de France',
-            '19406': "Crédit Agricole Provence Côte d'Azur"
+            '30027': 'Crédit Coopératif', '17515': 'Monabanq', '18206': 'N26'
         }
-def clean_iban(self, iban):
+    
+    def clean_iban(self, iban):
         if not iban:
             return ""
         return iban.replace(' ', '').replace('-', '').upper()
@@ -333,36 +237,7 @@ initialize_telegram_service()
 # GESTION CLIENTS - OPTIMISÉE POUR 500+ CLIENTS
 # ===================================================================
 
-clients_database = {}
-
-
-
-# --- Store usage: persister clients (redis-like en mémoire) ---
-STORE_KEY = "clients_database_v1"
-
-def save_clients_to_store():
-    try:
-        store_set(STORE_KEY, clients_database)
-        logger.info(f"💾 {len(clients_database)} clients sauvegardés dans le store (redis-like).")
-    except Exception as e:
-        logger.error(f"Erreur sauvegarde store: {e}")
-
-def load_clients_from_store():
-    global clients_database
-    try:
-        data = store_get(STORE_KEY)
-        if data:
-            clients_database = data
-            upload_stats["total_clients"] = len(clients_database)
-            upload_stats["last_upload"] = "♻️ Store rechargé"
-            logger.info(f"♻️ {len(clients_database)} clients rechargés depuis le store.")
-    except Exception as e:
-        logger.error(f"Erreur lecture store: {e}")
-
-# Charger le store au démarrage
-load_clients_from_store()
-# --- end store usage ---
-upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
+clients_database = {}upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
 
 def normalize_phone(phone):
     if not phone:
@@ -467,8 +342,7 @@ def load_clients_from_pipe_file(file_content):
                     "prenom": prenom,
                     "email": email,
                     "entreprise": "N/A",
-                    "telephone": telephone,
-                    "adresse": adresse,
+                    "telephone": telephone,"adresse": adresse,
                     "ville": ville,
                     "code_postal": code_postal,
                     "banque": banque,
@@ -494,11 +368,6 @@ def load_clients_from_pipe_file(file_content):
         upload_stats["total_clients"] = len(clients_database)
         upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
-        # Persist in store
-        try:
-            save_clients_to_store()
-        except Exception as e:
-            logger.error(f"Erreur sauvegarde après chargement: {e}")
         logger.info(f"✅ {loaded_count} clients chargés en {elapsed:.2f}s")
         return loaded_count
         
@@ -550,7 +419,7 @@ def process_telegram_command(message_text, chat_id):
     except Exception as e:
         return {"error": str(e)}
 
-#  ===================================================================
+# ===================================================================
 # ROUTES
 # ===================================================================
 
@@ -578,8 +447,7 @@ def ovh_webhook():
             "platform": "Render.com ⚡"
         })
         
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as e:return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/telegram', methods=['POST'])
 def telegram_webhook():
@@ -696,8 +564,7 @@ def home():
         .upload-section {
             background: #f8f9fa;
             padding: 30px;
-            border-radius: 12px;
-            margin: 20px 0;
+            border-radius: 12px;margin: 20px 0;
         }
         input[type="file"] { margin: 15px 0; }
         .format-info {
@@ -858,8 +725,8 @@ def home():
                 progressFill.textContent = '✅ Terminé!';
                 
                 if (data.status === 'success') {
-                    alert(`✅ ${data.clients} clients chargés avec succès!\n⚡ Temps: ${data.time || '< 1s'}`);
-                    setTimeout(() => location.reload(), 1500);
+                    alert(`✅ ${data.clients} clients chargés avec succès!\\n⚡ Temps: ${data.time || '< 1s'}`);
+                    setTimeout(() => location.reload(),setTimeout(() => location.reload(), 1500);
                 } else {
                     alert('❌ Erreur: ' + (data.error || 'Erreur inconnue'));
                     progressDiv.style.display = 'none';
@@ -982,8 +849,7 @@ def search_client(phone):
     })
 
 @app.route('/stats')
-def stats():
-    """Statistiques détaillées"""
+def stats():"""Statistiques détaillées"""
     banks_count = {}
     cities_count = {}
     
@@ -1061,7 +927,7 @@ def internal_error(error):
 # DÉMARRAGE
 # ===================================================================
 
-if __name__ == '__main__':
+if name == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     logger.info("=" * 60)
