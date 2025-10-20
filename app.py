@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = 'webhook-ovh-render-secure-v1'
+app.secret_key = 'webhook-ovh-render-secure-v2'
 
 # Configuration centralisée - Render.com
 class Config:
@@ -112,18 +112,89 @@ def rate_limit(calls_per_minute=30):
     return decorator
 
 # ===================================================================
-# SERVICE DÉTECTION IBAN (OPTIMISÉ - LOCAL ONLY)
+# SERVICE DÉTECTION IBAN - OPTIMISÉ AVEC CRÉDIT AGRICOLE COMPLET
 # ===================================================================
 
 class IBANDetector:
     def __init__(self):
+        # Banques principales
         self.local_banks = {
+            # BNP Paribas
             '10907': 'BNP Paribas', '30004': 'BNP Paribas',
-            '30003': 'Société Générale', '30002': 'Crédit Agricole','20041': 'La Banque Postale', '30056': 'BRED',
-            '10278': 'Crédit Mutuel', '10906': 'CIC',
-            '16798': 'ING Direct', '12548': 'Boursorama',
-            '30027': 'Crédit Coopératif', '17515': 'Monabanq', '18206': 'N26'
+            
+            # Société Générale
+            '30003': 'Société Générale',
+            
+            # La Banque Postale
+            '20041': 'La Banque Postale',
+            
+            # BRED
+            '30056': 'BRED',
+            
+            # Crédit Mutuel
+            '10278': 'Crédit Mutuel',
+            
+            # CIC
+            '10906': 'CIC',
+            
+            # Banques en ligne
+            '16798': 'ING Direct',
+            '12548': 'Boursorama',
+            '17515': 'Monabanq',
+            '18206': 'N26',
+            
+            # Autres
+            '30027': 'Crédit Coopératif',
         }
+        
+        # CRÉDIT AGRICOLE - TOUTES LES CAISSES RÉGIONALES
+        self.codes_ca = {
+            '13906': 'Crédit Agricole Centre-Est',
+            '14706': 'Crédit Agricole Atlantique Vendée',
+            '18706': 'Crédit Agricole Île-de-France',
+            '16906': 'Crédit Agricole Pyrénées Gascogne',
+            '18206': 'Crédit Agricole Nord-Est',
+            '11706': 'Crédit Agricole Charente Périgord',
+            '10206': 'Crédit Agricole Nord de France',
+            '13306': 'Crédit Agricole Aquitaine',
+            '13606': 'Crédit Agricole Centre Ouest',
+            '14506': 'Crédit Agricole Centre Loire',
+            '16606': 'Crédit Agricole Normandie-Seine',
+            '17206': 'Crédit Agricole Alsace Vosges',
+            '17906': 'Crédit Agricole Anjou Maine',
+            '12406': 'Crédit Agricole Charente-Maritime',
+            '12906': 'Crédit Agricole Finistère',
+            '12206': 'Crédit Agricole Morbihan',
+            '14806': 'Crédit Agricole Languedoc',
+            '17106': 'Crédit Agricole Loire Haute-Loire',
+            '11206': 'Crédit Agricole Brie Picardie',
+            '13106': 'Crédit Agricole Alpes Provence',
+            '14406': 'Crédit Agricole Ille-et-Vilaine',
+            '16106': 'Crédit Agricole Deux-Sèvres',
+            '16706': 'Crédit Agricole Sud Rhône Alpes',
+            '17306': 'Crédit Agricole Sud Méditerranée',
+            '18106': 'Crédit Agricole Touraine Poitou',
+            '19106': 'Crédit Agricole Centre France',
+            '12506': 'Crédit Agricole Loire Océan',
+            '13206': 'Crédit Agricole Midi-Pyrénées',
+            '14206': 'Crédit Agricole Normandie',
+            '15206': 'Crédit Agricole Savoie Mont Blanc',
+            '16206': 'Crédit Agricole Franche-Comté',
+            '17606': 'Crédit Agricole Lorraine',
+            '18406': 'Crédit Agricole Val de France',
+            '19406': 'Crédit Agricole Provence Côte d\'Azur',
+            
+            # Codes supplémentaires Crédit Agricole
+            '30002': 'Crédit Agricole',
+            '11315': 'Crédit Agricole',
+            '13335': 'Crédit Agricole',
+        }
+        
+        # Fusionner tous les codes
+        self.all_banks = {**self.local_banks, **self.codes_ca}
+        
+        logger.info(f"✅ Détecteur IBAN initialisé: {len(self.all_banks)} banques")
+        logger.info(f"   • Crédit Agricole: {len(self.codes_ca)} caisses régionales")
     
     def clean_iban(self, iban):
         if not iban:
@@ -131,24 +202,39 @@ class IBANDetector:
         return iban.replace(' ', '').replace('-', '').upper()
     
     def detect_local(self, iban_clean):
-        """Détection locale uniquement - RAPIDE"""
+        """Détection locale optimisée - ULTRA-RAPIDE"""
         if not iban_clean.startswith('FR'):
             return "Banque étrangère"
+        
         if len(iban_clean) < 14:
             return "IBAN invalide"
+        
         try:
+            # Code banque (5 chiffres après FR + 2 chiffres de contrôle)
             code_banque = iban_clean[4:9]
-            return self.local_banks.get(code_banque, f"Banque française ({code_banque})")
-        except:
+            
+            # Recherche dans la base complète
+            bank_name = self.all_banks.get(code_banque)
+            
+            if bank_name:
+                return bank_name
+            
+            # Si non trouvé, retourner le code
+            return f"Banque française ({code_banque})"
+            
+        except Exception as e:
+            logger.error(f"Erreur détection: {str(e)}")
             return "IBAN invalide"
     
     def detect_bank(self, iban):
         """Point d'entrée principal - LOCAL ONLY pour performance"""
         if not iban:
             return "N/A"
+        
         iban_clean = self.clean_iban(iban)
         if not iban_clean:
             return "N/A"
+        
         return self.detect_local(iban_clean)
 
 iban_detector = IBANDetector()
@@ -237,7 +323,8 @@ initialize_telegram_service()
 # GESTION CLIENTS - OPTIMISÉE POUR 500+ CLIENTS
 # ===================================================================
 
-clients_database = {}upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
+clients_database = {}
+upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0}
 
 def normalize_phone(phone):
     if not phone:
@@ -282,9 +369,10 @@ def load_clients_from_pipe_file(file_content):
     try:
         lines = file_content.strip().split('\n')
         loaded_count = 0
+        banks_detected = 0
         start_time = time.time()
         
-        logger.info(f"🔄 Début chargement de {len(lines)} lignes...")
+        logger.info(f"📄 Début chargement de {len(lines)} lignes...")
         
         for line in lines:
             try:
@@ -330,10 +418,15 @@ def load_clients_from_pipe_file(file_content):
                     ville = ville_code
                     code_postal = ''
                 
-                # Détection banque LOCALE uniquement (pas d'API = instantané)
+                # Détection banque LOCALE avec base étendue
                 if iban:
                     iban_clean = iban_detector.clean_iban(iban)
-                    banque = f"🏦 {iban_detector.detect_local(iban_clean)}"
+                    banque_detectee = iban_detector.detect_local(iban_clean)
+                    banque = f"🏦 {banque_detectee}"
+                    
+                    # Compteur de banques détectées (pas "invalide" ou "étrangère")
+                    if banque_detectee not in ['IBAN invalide', 'Banque étrangère'] and not banque_detectee.startswith('Banque française'):
+                        banks_detected += 1
                 else:
                     banque = 'N/A'
                 
@@ -342,7 +435,8 @@ def load_clients_from_pipe_file(file_content):
                     "prenom": prenom,
                     "email": email,
                     "entreprise": "N/A",
-                    "telephone": telephone,"adresse": adresse,
+                    "telephone": telephone,
+                    "adresse": adresse,
                     "ville": ville,
                     "code_postal": code_postal,
                     "banque": banque,
@@ -361,14 +455,16 @@ def load_clients_from_pipe_file(file_content):
                 loaded_count += 1
                 
             except Exception:
-                # Pas de log pour chaque erreur (performance)
                 continue
         
         elapsed = time.time() - start_time
         upload_stats["total_clients"] = len(clients_database)
         upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        upload_stats["banks_detected"] = banks_detected
         
         logger.info(f"✅ {loaded_count} clients chargés en {elapsed:.2f}s")
+        logger.info(f"🏦 {banks_detected} banques identifiées précisément")
+        
         return loaded_count
         
     except Exception as e:
@@ -408,9 +504,11 @@ def process_telegram_command(message_text, chat_id):
         elif message_text.startswith('/stats'):
             msg = f"""📊 <b>STATS</b>
 👥 Clients: {upload_stats['total_clients']}
-📁 Upload: {upload_stats['last_upload'] or 'Aucun'}
+🏦 Banques détectées: {upload_stats.get('banks_detected', 0)}
+📅 Upload: {upload_stats['last_upload'] or 'Aucun'}
 📞 Ligne: {Config.OVH_LINE_NUMBER}
-🌐 Plateforme: Render.com ⚡ OPTIMISÉ"""
+🌐 Plateforme: Render.com ⚡ OPTIMISÉ
+💾 Base CA complète: {len(iban_detector.codes_ca)} caisses régionales"""
             telegram_service.send_message(msg)
             return {"status": "ok", "command": "stats"}
         
@@ -422,6 +520,7 @@ def process_telegram_command(message_text, chat_id):
 # ===================================================================
 # ROUTES
 # ===================================================================
+
 
 @app.route('/webhook/ovh', methods=['POST', 'GET'])
 def ovh_webhook():
@@ -447,7 +546,8 @@ def ovh_webhook():
             "platform": "Render.com ⚡"
         })
         
-    except Exception as e:return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/telegram', methods=['POST'])
 def telegram_webhook():
@@ -472,13 +572,13 @@ def ping():
         "status": "alive",
         "timestamp": datetime.now().isoformat(),
         "platform": "Render.com ⚡",
-        "clients": upload_stats["total_clients"]
+        "clients": upload_stats["total_clients"],
+        "banks_detected": upload_stats.get("banks_detected", 0)
     })
 
 @app.route('/')
 def home():
-    auto_detected = len([c for c in clients_database.values() 
-                        if c['banque'] not in ['N/A', ''] and c['iban']])
+    auto_detected = upload_stats.get("banks_detected", 0)
     
     return render_template_string("""
 <!DOCTYPE html>
@@ -486,7 +586,7 @@ def home():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ Webhook Render OPTIMISÉ</title>
+    <title>⚡ Webhook Render OPTIMISÉ v2</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -564,7 +664,8 @@ def home():
         .upload-section {
             background: #f8f9fa;
             padding: 30px;
-            border-radius: 12px;margin: 20px 0;
+            border-radius: 12px;
+            margin: 20px 0;
         }
         input[type="file"] { margin: 15px 0; }
         .format-info {
@@ -612,21 +713,23 @@ def home():
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Webhook Render OPTIMISÉ</h1>
+            <h1>⚡ Webhook Render OPTIMISÉ v2</h1>
             <div class="badge">Chat ID: {{ chat_id }}</div>
             <div class="badge success">✅ Keep-Alive Actif</div>
             <div class="badge success">⚡ ULTRA-RAPIDE</div>
+            <div class="badge success">🏦 CA Complet</div>
         </div>
         
         <div class="content">
             {% if config_valid %}
             <div class="alert alert-success">
                 <strong>✅ Configuration active</strong><br>
-                Plateforme: Render.com ⚡ OPTIMISÉ<br>
+                Plateforme: Render.com ⚡ OPTIMISÉ v2<br>
                 Chat ID: {{ chat_id }}<br>
                 Ligne OVH: {{ ovh_line }}<br>
                 🔄 Système anti-sleep: Actif<br>
-                ⚡ Chargement 500+ clients: < 1 seconde
+                ⚡ Chargement 500+ clients: < 1 seconde<br>
+                🏦 Base Crédit Agricole: {{ ca_caisses }} caisses régionales
             </div>
             {% else %}
             <div class="alert alert-error">
@@ -636,8 +739,10 @@ def home():
             {% endif %}
             
             <div class="alert alert-info">
-                <strong>⚡ OPTIMISATIONS ACTIVES</strong><br>
+                <strong>⚡ OPTIMISATIONS ACTIVES v2</strong><br>
                 ✅ Détection banque locale instantanée<br>
+                ✅ Base Crédit Agricole complète ({{ ca_caisses }} caisses)<br>
+                ✅ {{ total_banks }} banques en base<br>
                 ✅ Pas d'appels API externes pendant le chargement<br>
                 ✅ Traitement optimisé pour 500+ clients<br>
                 ✅ Temps de chargement: < 1 seconde
@@ -653,7 +758,7 @@ def home():
                     <div class="value">{{ auto_detected }}</div>
                 </div>
                 <div class="stat-card">
-                    <h3>📁 Dernier upload</h3>
+                    <h3>📅 Dernier upload</h3>
                     <div class="value" style="font-size:1.2em;">{{ last_upload or 'Aucun' }}</div>
                 </div>
             </div>
@@ -667,7 +772,8 @@ def home():
                         <code>tel|nom prenom|date|email|adresse|ville (code)|iban|swift</code><br><br>
                         <strong>Exemple:</strong><br>
                         <code>0669290606|Islam Soussi|01/09/1976|email@gmail.com|2 Avenue|Paris (75001)|FR76...|AGRIFRPP839</code><br><br>
-                        <strong>⚡ Performance:</strong> 500+ clients en < 1 seconde
+                        <strong>⚡ Performance:</strong> 500+ clients en < 1 seconde<br>
+                        <strong>🏦 Détection:</strong> {{ total_banks }} banques dont {{ ca_caisses }} CA
                     </div>
                     <input type="file" name="file" accept=".txt" required id="fileInput">
                     <br>
@@ -697,8 +803,8 @@ def home():
             <div class="config-box">
                 <h3>📱 Commandes Telegram</h3>
                 <code>/numero 0669290606</code> - Fiche client<br>
-                <code>/iban FR76...</code> - Détection banque<br>
-                <code>/stats</code> - Statistiques
+                <code>/iban FR76...</code> - Détection banque ({{ total_banks }} banques)<br>
+                <code>/stats</code> - Statistiques complètes
             </div>
         </div>
     </div>
@@ -725,8 +831,8 @@ def home():
                 progressFill.textContent = '✅ Terminé!';
                 
                 if (data.status === 'success') {
-                    alert(`✅ ${data.clients} clients chargés avec succès!\\n⚡ Temps: ${data.time || '< 1s'}`);
-                    setTimeout(() => location.reload(),setTimeout(() => location.reload(), 1500);
+                    alert(`✅ ${data.clients} clients chargés avec succès!\n🏦 ${data.banks_detected} banques détectées\n⚡ Temps: ${data.time || '< 1s'}`);
+                    setTimeout(() => location.reload(), 1500);
                 } else {
                     alert('❌ Erreur: ' + (data.error || 'Erreur inconnue'));
                     progressDiv.style.display = 'none';
@@ -747,7 +853,9 @@ def home():
     last_upload=upload_stats.get("last_upload"),
     chat_id=Config.CHAT_ID,
     ovh_line=Config.OVH_LINE_NUMBER,
-    webhook_url=request.url_root.rstrip('/')
+    webhook_url=request.url_root.rstrip('/'),
+    ca_caisses=len(iban_detector.codes_ca),
+    total_banks=len(iban_detector.all_banks)
     )
 
 @app.route('/upload', methods=['POST'])
@@ -774,8 +882,9 @@ def upload_file():
         return jsonify({
             "status": "success", 
             "clients": nb,
+            "banks_detected": upload_stats.get("banks_detected", 0),
             "time": f"{elapsed:.2f}s",
-            "message": f"✅ {nb} clients chargés en {elapsed:.2f}s"
+            "message": f"✅ {nb} clients chargés en {elapsed:.2f}s - {upload_stats.get('banks_detected', 0)} banques détectées"
         })
     except Exception as e:
         logger.error(f"Erreur upload: {str(e)}")
@@ -795,7 +904,11 @@ def test_telegram():
     if not telegram_service:
         return jsonify({"error": "Non configuré"}), 400
     
-    msg = f"⚡ Test Render.com OPTIMISÉ - {datetime.now().strftime('%H:%M:%S')}\n✅ Chargement 500+ clients en < 1s"
+    msg = f"""⚡ Test Render.com OPTIMISÉ v2 - {datetime.now().strftime('%H:%M:%S')}
+✅ Chargement 500+ clients en < 1s
+🏦 Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses régionales
+💾 Total banques: {len(iban_detector.all_banks)} en base"""
+    
     result = telegram_service.send_message(msg)
     return jsonify({"status": "success" if result else "error"})
 
@@ -824,13 +937,21 @@ def fix_webhook():
 def health():
     return jsonify({
         "status": "healthy",
-        "platform": "Render.com ⚡ OPTIMISÉ",
+        "platform": "Render.com ⚡ OPTIMISÉ v2",
         "chat_id": Config.CHAT_ID,
         "config_valid": config_valid,
         "clients": upload_stats["total_clients"],
+        "banks_detected": upload_stats.get("banks_detected", 0),
         "keep_alive": "active",
+        "iban_detector": {
+            "total_banks": len(iban_detector.all_banks),
+            "credit_agricole_caisses": len(iban_detector.codes_ca),
+            "other_banks": len(iban_detector.local_banks)
+        },
         "optimizations": [
             "Détection banque locale instantanée",
+            f"Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses",
+            f"Total: {len(iban_detector.all_banks)} banques en base",
             "Pas d'appels API externes",
             "Traitement optimisé 500+ clients",
             "Temps chargement: < 1 seconde"
@@ -849,7 +970,8 @@ def search_client(phone):
     })
 
 @app.route('/stats')
-def stats():"""Statistiques détaillées"""
+def stats():
+    """Statistiques détaillées"""
     banks_count = {}
     cities_count = {}
     
@@ -868,11 +990,17 @@ def stats():"""Statistiques détaillées"""
     
     return jsonify({
         "total_clients": len(clients_database),
+        "banks_detected": upload_stats.get("banks_detected", 0),
         "last_upload": upload_stats.get("last_upload"),
         "filename": upload_stats.get("filename"),
         "top_banks": [{"bank": b[0], "count": b[1]} for b in top_banks],
         "top_cities": [{"city": c[0], "count": c[1]} for c in top_cities],
-        "platform": "Render.com ⚡ OPTIMISÉ"
+        "iban_detector_stats": {
+            "total_banks_in_database": len(iban_detector.all_banks),
+            "credit_agricole_caisses": len(iban_detector.codes_ca),
+            "other_banks": len(iban_detector.local_banks)
+        },
+        "platform": "Render.com ⚡ OPTIMISÉ v2"
     })
 
 @app.route('/clear')
@@ -882,7 +1010,7 @@ def clear_database():
     
     count = len(clients_database)
     clients_database = {}
-    upload_stats = {"total_clients": 0, "last_upload": None, "filename": None}
+    upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0}
     
     logger.info(f"🗑️ Base de données vidée ({count} clients supprimés)")
     
@@ -890,6 +1018,22 @@ def clear_database():
         "status": "success",
         "message": f"✅ {count} clients supprimés",
         "clients_remaining": 0
+    })
+
+@app.route('/banks')
+def list_banks():
+    """Liste toutes les banques en base"""
+    return jsonify({
+        "total_banks": len(iban_detector.all_banks),
+        "credit_agricole": {
+            "count": len(iban_detector.codes_ca),
+            "caisses": list(iban_detector.codes_ca.values())
+        },
+        "other_banks": {
+            "count": len(iban_detector.local_banks),
+            "banks": list(iban_detector.local_banks.values())
+        },
+        "all_codes": iban_detector.all_banks
     })
 
 # ===================================================================
@@ -908,6 +1052,7 @@ def not_found(error):
             "/clients",
             "/search/<phone>",
             "/stats",
+            "/banks",
             "/test-telegram",
             "/fix-webhook",
             "/health",
@@ -923,21 +1068,23 @@ def internal_error(error):
         "message": str(error)
     }), 500
 
-# ===================================================================
+#  ===================================================================
 # DÉMARRAGE
 # ===================================================================
 
-if name == '__main__':
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     logger.info("=" * 60)
-    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION OPTIMISÉE")
+    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION OPTIMISÉE v2")
     logger.info("=" * 60)
     logger.info(f"📱 Chat ID: {Config.CHAT_ID}")
     logger.info(f"📞 Ligne OVH: {Config.OVH_LINE_NUMBER}")
     logger.info(f"🔄 Keep-alive: Actif")
     logger.info(f"⚡ Optimisations: ACTIVES")
     logger.info(f"   • Détection banque locale instantanée")
+    logger.info(f"   • Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses")
+    logger.info(f"   • Total banques: {len(iban_detector.all_banks)}")
     logger.info(f"   • Pas d'appels API externes")
     logger.info(f"   • Chargement 500+ clients en < 1s")
     logger.info("=" * 60)
