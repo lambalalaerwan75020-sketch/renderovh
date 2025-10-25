@@ -11,6 +11,7 @@ import threading
 import io
 import csv
 from collections import defaultdict
+import openpyxl  # NOUVEAU: Support Excel
 
 # ===================================================================
 # CONFIGURATION ET LOGGING
@@ -32,6 +33,8 @@ class Config:
     CHAT_ID = os.environ.get('CHAT_ID', '-4928923400')
     OVH_LINE_NUMBER = os.environ.get('OVH_LINE_NUMBER', '0033185093039')
     RENDER = os.environ.get('RENDER', False)
+    # NOUVEAU: Formats de fichiers acceptés
+    ALLOWED_EXTENSIONS = {'txt', 'xls', 'xlsx'}
 
 def check_required_config():
     missing_vars = []
@@ -266,8 +269,6 @@ class IBANDetector:
             '17606': 'Crédit Agricole Lorraine',
             '18406': 'Crédit Agricole Val de France',
             '19406': 'Crédit Agricole Provence Côte d\'Azur',
-            
-            # CODES MANQUANTS TROUVÉS DANS VOS FICHES CLIENT
             '19906': 'Crédit Agricole Côtes d\'Armor',
             '16806': 'Crédit Agricole Cantal Auvergne',
             '12006': 'Crédit Agricole Corse',
@@ -277,8 +278,6 @@ class IBANDetector:
             '13506': 'Crédit Agricole Languedoc',
             '18306': 'Crédit Agricole Normandie',
             '11306': 'Crédit Agricole Alpes Provence',
-            
-            # Codes supplémentaires Crédit Agricole
             '30002': 'Crédit Agricole',
             '11315': 'Crédit Agricole',
             '13335': 'Crédit Agricole',
@@ -306,16 +305,12 @@ class IBANDetector:
             return "IBAN invalide"
         
         try:
-            # Code banque (5 chiffres après FR + 2 chiffres de contrôle)
             code_banque = iban_clean[4:9]
-            
-            # Recherche dans la base complète
             bank_name = self.all_banks.get(code_banque)
             
             if bank_name:
                 return bank_name
             
-            # Si non trouvé, retourner le code
             return f"Banque française ({code_banque})"
             
         except Exception as e:
@@ -431,7 +426,7 @@ initialize_telegram_service()
 # ===================================================================
 
 clients_database = {}
-clients_by_bank = defaultdict(list)  # Nouveau: clients groupés par banque
+clients_by_bank = defaultdict(list)
 upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0}
 
 def normalize_phone(phone):
@@ -469,110 +464,114 @@ def get_client_info(phone_number):
     
     return create_unknown_client(phone_number)
 
-def load_clients_from_pipe_file(file_content):
-    """Charge les clients depuis le format pipe (|) - OPTIMISÉ POUR 500+ CLIENTS"""
+# ===================================================================
+# NOUVEAU: CHARGEMENT DEPUIS EXCEL
+# ===================================================================
+
+def load_clients_from_excel(file_stream):
+    """Charge les clients depuis un fichier Excel (.xls ou .xlsx)"""
     global clients_database, clients_by_bank, upload_stats
     clients_database = {}
-    clients_by_bank = defaultdict(list)  # Réinitialiser le groupement par banque
+    clients_by_bank = defaultdict(list)
     
     try:
-        lines = file_content.strip().split('\n')
+        workbook = openpyxl.load_workbook(file_stream, data_only=True)
+        sheet = workbook.active
+        
         loaded_count = 0
         banks_detected = 0
         start_time = time.time()
         
-        # Statistiques de diagnostic
-        stats_diagnostic = {
-            'iban_vide': 0,
-            'iban_invalide': 0,
-            'iban_etranger': 0,
-            'code_inconnu': 0,
-            'code_ca_detecte': 0,
-            'autres_banques': 0,
-            'codes_manquants': set()
-        }
+        logger.info(f"📊 Lecture Excel: {sheet.max_row} lignes")
         
-        logger.info(f"📄 Début chargement de {len(lines)} lignes...")
+        # Lire la première ligne pour détecter les en-têtes
+        headers = []
+        first_row = list(sheet.iter_rows(min_row=1, max_row=1, values_only=True))[0]
         
-        for line in lines:
+        # Détection des colonnes (flexible)
+        col_mapping = {}
+        for idx, header in enumerate(first_row):
+            if header:
+                header_lower = str(header).lower().strip()
+                if 'tel' in header_lower or 'phone' in header_lower:
+                    col_mapping['telephone'] = idx
+                elif 'nom' in header_lower and 'prenom' not in header_lower:
+                    col_mapping['nom'] = idx
+                elif 'prenom' in header_lower or 'prénom' in header_lower:
+                    col_mapping['prenom'] = idx
+                elif 'naissance' in header_lower or 'birth' in header_lower:
+                    col_mapping['date_naissance'] = idx
+                elif 'email' in header_lower or 'mail' in header_lower:
+                    col_mapping['email'] = idx
+                elif 'adresse' in header_lower or 'address' in header_lower:
+                    col_mapping['adresse'] = idx
+                elif 'ville' in header_lower or 'city' in header_lower:
+                    col_mapping['ville'] = idx
+                elif 'code' in header_lower and 'postal' in header_lower:
+                    col_mapping['code_postal'] = idx
+                elif 'iban' in header_lower:
+                    col_mapping['iban'] = idx
+                elif 'swift' in header_lower or 'bic' in header_lower:
+                    col_mapping['swift'] = idx
+        
+        logger.info(f"📋 Colonnes détectées: {list(col_mapping.keys())}")
+        
+        # Lire les données (à partir de la ligne 2)
+        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
             try:
-                if not line.strip():
+                if not row or all(cell is None or str(cell).strip() == '' for cell in row):
                     continue
                 
-                # Format: telephone|nom|date_naissance|email|adresse|ville|iban|swift
-                parts = line.split('|')
+                # Extraction des données selon les colonnes détectées
+                def get_cell(key, default=''):
+                    idx = col_mapping.get(key)
+                    if idx is not None and idx < len(row):
+                        value = row[idx]
+                        return str(value).strip() if value is not None else default
+                    return default
                 
-                if len(parts) < 7:
-                    continue
-                
-                # Extraction des données
-                telephone_raw = parts[0].strip()
-                nom_complet = parts[1].strip() if len(parts) > 1 else ''
-                date_naissance = parts[2].strip() if len(parts) > 2 else ''
-                email = parts[3].strip() if len(parts) > 3 else ''
-                adresse = parts[4].strip() if len(parts) > 4 else ''
-                ville_code = parts[5].strip() if len(parts) > 5 else ''
-                iban = parts[6].strip() if len(parts) > 6 else ''
-                swift = parts[7].strip() if len(parts) > 7 else ''
+                telephone_raw = get_cell('telephone')
+                nom = get_cell('nom')
+                prenom = get_cell('prenom')
+                date_naissance = get_cell('date_naissance')
+                email = get_cell('email')
+                adresse = get_cell('adresse')
+                ville = get_cell('ville')
+                code_postal = get_cell('code_postal')
+                iban = get_cell('iban')
+                swift = get_cell('swift')
                 
                 # Normalisation téléphone
                 telephone = normalize_phone(telephone_raw)
                 if not telephone:
                     continue
                 
-                # Extraction nom/prénom
-                nom_parts = nom_complet.split(' ', 1)
-                if len(nom_parts) == 2:
-                    nom = nom_parts[0]
-                    prenom = nom_parts[1]
-                else:
-                    nom = nom_complet
-                    prenom = ''
+                # Si nom et prénom sont dans la même colonne
+                if not prenom and ' ' in nom:
+                    parts = nom.split(' ', 1)
+                    nom = parts[0]
+                    prenom = parts[1] if len(parts) > 1 else ''
                 
-                # Extraction ville et code postal
-                ville_match = re.match(r'(.+?)\s*\((\d{5})\)', ville_code)
-                if ville_match:
-                    ville = ville_match.group(1).strip()
-                    code_postal = ville_match.group(2)
-                else:
-                    ville = ville_code
-                    code_postal = ''
-                
-                # Détection banque LOCALE avec base étendue + DIAGNOSTIC
+                # Détection banque
                 bank_code = "unknown"
                 if not iban or iban == '':
                     banque = 'N/A'
-                    stats_diagnostic['iban_vide'] += 1
                 else:
                     iban_clean = iban_detector.clean_iban(iban)
                     bank_code = iban_detector.extract_bank_code(iban)
                     
-                    # Vérification format IBAN
                     if len(iban_clean) < 14 or not iban_clean.startswith('FR'):
                         if not iban_clean.startswith('FR'):
                             banque_detectee = "Banque étrangère"
-                            stats_diagnostic['iban_etranger'] += 1
                         else:
                             banque_detectee = "IBAN invalide"
-                            stats_diagnostic['iban_invalide'] += 1
                     else:
-                        # Extraction du code banque
                         banque_detectee = iban_detector.all_banks.get(bank_code)
                         
                         if banque_detectee:
-                            # Banque détectée avec succès
                             banks_detected += 1
-                            
-                            # Statistique détaillée
-                            if bank_code in iban_detector.codes_ca:
-                                stats_diagnostic['code_ca_detecte'] += 1
-                            else:
-                                stats_diagnostic['autres_banques'] += 1
                         else:
-                            # Code banque inconnu
                             banque_detectee = f"Banque française ({bank_code})"
-                            stats_diagnostic['code_inconnu'] += 1
-                            stats_diagnostic['codes_manquants'].add(bank_code)
                     
                     banque = f"🏦 {banque_detectee}"
                 
@@ -587,7 +586,7 @@ def load_clients_from_pipe_file(file_content):
                     "ville": ville,
                     "code_postal": code_postal,
                     "banque": banque,
-                    "bank_code": bank_code,  # Stocker le code banque
+                    "bank_code": bank_code,
                     "swift": swift,
                     "iban": iban,
                     "sexe": "N/A",
@@ -602,8 +601,129 @@ def load_clients_from_pipe_file(file_content):
                 }
                 
                 clients_database[telephone] = client_data
+                clients_by_bank[bank_code].append(telephone)
                 
-                # Ajouter au groupement par banque
+                loaded_count += 1
+                
+            except Exception as e:
+                logger.warning(f"Erreur ligne {row_idx}: {str(e)}")
+                continue
+        
+        elapsed = time.time() - start_time
+        upload_stats["total_clients"] = len(clients_database)
+        upload_stats["last_upload"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        upload_stats["banks_detected"] = banks_detected
+        
+        logger.info(f"✅ {loaded_count} clients chargés depuis Excel en {elapsed:.2f}s")
+        logger.info(f"🏦 {banks_detected} banques identifiées précisément")
+        logger.info(f"📊 Groupement par banque: {len(clients_by_bank)} banques différentes")
+        
+        return loaded_count
+        
+    except Exception as e:
+        logger.error(f"Erreur chargement Excel: {str(e)}")
+        raise ValueError(f"Erreur lecture Excel: {str(e)}")
+
+def load_clients_from_pipe_file(file_content):
+    """Charge les clients depuis le format pipe (|) - OPTIMISÉ POUR 500+ CLIENTS"""
+    global clients_database, clients_by_bank, upload_stats
+    clients_database = {}
+    clients_by_bank = defaultdict(list)
+    
+    try:
+        lines = file_content.strip().split('\n')
+        loaded_count = 0
+        banks_detected = 0
+        start_time = time.time()
+        
+        logger.info(f"📄 Début chargement de {len(lines)} lignes...")
+        
+        for line in lines:
+            try:
+                if not line.strip():
+                    continue
+                
+                parts = line.split('|')
+                
+                if len(parts) < 7:
+                    continue
+                
+                telephone_raw = parts[0].strip()
+                nom_complet = parts[1].strip() if len(parts) > 1 else ''
+                date_naissance = parts[2].strip() if len(parts) > 2 else ''
+                email = parts[3].strip() if len(parts) > 3 else ''
+                adresse = parts[4].strip() if len(parts) > 4 else ''
+                ville_code = parts[5].strip() if len(parts) > 5 else ''
+                iban = parts[6].strip() if len(parts) > 6 else ''
+                swift = parts[7].strip() if len(parts) > 7 else ''
+                
+                telephone = normalize_phone(telephone_raw)
+                if not telephone:
+                    continue
+                
+                nom_parts = nom_complet.split(' ', 1)
+                if len(nom_parts) == 2:
+                    nom = nom_parts[0]
+                    prenom = nom_parts[1]
+                else:
+                    nom = nom_complet
+                    prenom = ''
+                
+                ville_match = re.match(r'(.+?)\s*\((\d{5})\)', ville_code)
+                if ville_match:
+                    ville = ville_match.group(1).strip()
+                    code_postal = ville_match.group(2)
+                else:
+                    ville = ville_code
+                    code_postal = ''
+                
+                bank_code = "unknown"
+                if not iban or iban == '':
+                    banque = 'N/A'
+                else:
+                    iban_clean = iban_detector.clean_iban(iban)
+                    bank_code = iban_detector.extract_bank_code(iban)
+                    
+                    if len(iban_clean) < 14 or not iban_clean.startswith('FR'):
+                        if not iban_clean.startswith('FR'):
+                            banque_detectee = "Banque étrangère"
+                        else:
+                            banque_detectee = "IBAN invalide"
+                    else:
+                        banque_detectee = iban_detector.all_banks.get(bank_code)
+                        
+                        if banque_detectee:
+                            banks_detected += 1
+                        else:
+                            banque_detectee = f"Banque française ({bank_code})"
+                    
+                    banque = f"🏦 {banque_detectee}"
+                
+                client_data = {
+                    "nom": nom,
+                    "prenom": prenom,
+                    "email": email,
+                    "entreprise": "N/A",
+                    "telephone": telephone,
+                    "adresse": adresse,
+                    "ville": ville,
+                    "code_postal": code_postal,
+                    "banque": banque,
+                    "bank_code": bank_code,
+                    "swift": swift,
+                    "iban": iban,
+                    "sexe": "N/A",
+                    "date_naissance": date_naissance,
+                    "lieu_naissance": "N/A",
+                    "profession": "N/A",
+                    "statut": "Prospect",
+                    "date_upload": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    "nb_appels": 0,
+                    "dernier_appel": None,
+                    "notes": ""
+                }
+                
+                clients_database[telephone] = client_data
                 clients_by_bank[bank_code].append(telephone)
                 
                 loaded_count += 1
@@ -686,7 +806,6 @@ def generate_bank_file(bank_code, format_type='txt'):
     client_phones = clients_by_bank[bank_code]
     
     if format_type == 'txt':
-        # Format pipe délimité
         lines = []
         for phone in client_phones:
             client = clients_database[phone]
@@ -707,15 +826,12 @@ def generate_bank_file(bank_code, format_type='txt'):
         return content, filename, 'text/plain'
     
     elif format_type == 'csv':
-        # Format CSV
         output = io.StringIO()
         writer = csv.writer(output, delimiter=';')
         
-        # En-tête
         writer.writerow(['Telephone', 'Nom', 'Prenom', 'Date_Naissance', 'Email', 
                         'Adresse', 'Ville', 'Code_Postal', 'IBAN', 'SWIFT'])
         
-        # Données
         for phone in client_phones:
             client = clients_database[phone]
             writer.writerow([
@@ -762,11 +878,9 @@ def generate_all_clients_file(format_type='txt'):
         output = io.StringIO()
         writer = csv.writer(output, delimiter=';')
         
-        # En-tête
         writer.writerow(['Telephone', 'Nom', 'Prenom', 'Date_Naissance', 'Email', 
                         'Adresse', 'Ville', 'Code_Postal', 'IBAN', 'SWIFT', 'Banque'])
         
-        # Données
         for phone, client in clients_database.items():
             writer.writerow([
                 client['telephone'],
@@ -851,7 +965,6 @@ def ping():
 def home():
     auto_detected = upload_stats.get("banks_detected", 0)
     
-    # Préparer les statistiques par banque pour l'affichage
     bank_stats = []
     for bank_code, phones in clients_by_bank.items():
         bank_name = iban_detector.all_banks.get(bank_code, f"Banque {bank_code}")
@@ -863,7 +976,6 @@ def home():
             'download_csv': f"/download/bank/{bank_code}/csv"
         })
     
-    # Trier par nombre de clients décroissant
     bank_stats.sort(key=lambda x: x['count'], reverse=True)
     
     return render_template_string("""
@@ -872,7 +984,7 @@ def home():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ Webhook Render OPTIMISÉ v2 - Téléchargement par Banque</title>
+    <title>⚡ Webhook Render OPTIMISÉ v2 + Excel</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -947,8 +1059,6 @@ def home():
         .btn-primary { background: #667eea; }
         .btn-success { background: #28a745; }
         .btn-danger { background: #dc3545; }
-        .btn-warning { background: #ffc107; color: black; }
-        .btn-info { background: #0dcaf0; }
         .btn:hover { transform: translateY(-2px); opacity: 0.9; }
         .upload-section {
             background: #f8f9fa;
@@ -956,7 +1066,7 @@ def home():
             border-radius: 12px;
             margin: 20px 0;
         }
-        input[type="file"] { margin: 15px 0; }
+        input[type="file"] { margin: 15px 0; padding: 10px; width: 100%; }
         .format-info {
             background: #e9ecef;
             padding: 15px;
@@ -964,20 +1074,21 @@ def home():
             margin: 15px 0;
             font-size: 0.9em;
         }
-        .config-box {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin: 20px 0;
-            font-family: monospace;
+        .format-tabs {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
         }
-        .config-box code {
-            background: white;
-            padding: 10px;
-            display: block;
-            border-radius: 5px;
-            margin: 10px 0;
-            word-break: break-all;
+        .format-tab {
+            padding: 10px 20px;
+            background: #e9ecef;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .format-tab.active {
+            background: #667eea;
+            color: white;
         }
         .progress-bar {
             width: 100%;
@@ -1054,15 +1165,20 @@ def home():
             border-bottom: 2px solid #667eea;
             padding-bottom: 10px;
         }
+        .excel-icon {
+            font-size: 3em;
+            margin: 10px 0;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Webhook Render OPTIMISÉ v2</h1>
+            <h1>⚡ Webhook Render OPTIMISÉ v2 + Excel</h1>
             <div class="badge">Chat ID: {{ chat_id }}</div>
             <div class="badge success">✅ Keep-Alive Actif</div>
             <div class="badge success">⚡ ULTRA-RAPIDE</div>
+            <div class="badge success">📊 Support Excel</div>
             <div class="badge success">🏦 Téléchargement par Banque</div>
         </div>
         
@@ -1070,11 +1186,12 @@ def home():
             {% if config_valid %}
             <div class="alert alert-success">
                 <strong>✅ Configuration active</strong><br>
-                Plateforme: Render.com ⚡ OPTIMISÉ v2<br>
+                Plateforme: Render.com ⚡ OPTIMISÉ v2 + Excel<br>
                 Chat ID: {{ chat_id }}<br>
                 Ligne OVH: {{ ovh_line }}<br>
                 🔄 Système anti-sleep: Actif<br>
                 ⚡ Chargement 500+ clients: < 1 seconde<br>
+                📊 Support: TXT, XLS, XLSX<br>
                 🏦 Base Crédit Agricole: {{ ca_caisses }} caisses régionales<br>
                 📊 Groupement: {{ banks_count }} banques détectées
             </div>
@@ -1086,11 +1203,12 @@ def home():
             {% endif %}
             
             <div class="alert alert-info">
-                <strong>⚡ OPTIMISATIONS ACTIVES v2</strong><br>
+                <strong>⚡ OPTIMISATIONS ACTIVES v2 + Excel</strong><br>
                 ✅ Détection banque locale instantanée<br>
                 ✅ Base Crédit Agricole complète ({{ ca_caisses }} caisses)<br>
                 ✅ {{ total_banks }} banques en base<br>
-                ✅ Pas d'appels API externes pendant le chargement<br>
+                ✅ Support Excel .xls et .xlsx<br>
+                ✅ Détection automatique des colonnes<br>
                 ✅ Traitement optimisé pour 500+ clients<br>
                 ✅ Temps de chargement: < 1 seconde<br>
                 ✅ Téléchargement par banque: TXT et CSV
@@ -1154,20 +1272,45 @@ def home():
             
             <div class="upload-section">
                 <h2>📂 Upload fichier clients</h2>
+                <div class="excel-icon">📊 💾</div>
+                
                 <form action="/upload" method="post" enctype="multipart/form-data" id="uploadForm">
                     <div class="format-info">
-                        <strong>📋 Format:</strong> Fichier texte (.txt) avec pipe (|)<br><br>
-                        <strong>Structure:</strong><br>
-                        <code>tel|nom prenom|date|email|adresse|ville (code)|iban|swift</code><br><br>
-                        <strong>Exemple:</strong><br>
-                        <code>0669290606|Islam Soussi|01/09/1976|email@gmail.com|2 Avenue|Paris (75001)|FR76...|AGRIFRPP839</code><br><br>
+                        <strong>📋 Formats acceptés:</strong><br><br>
+                        
+                        <div class="format-tabs">
+                            <div class="format-tab active" onclick="showFormat('txt')">📄 TXT (Pipe)</div>
+                            <div class="format-tab" onclick="showFormat('excel')">📊 Excel (XLS/XLSX)</div>
+                        </div>
+                        
+                        <div id="format-txt" style="display: block;">
+                            <strong>Format TXT avec pipe (|):</strong><br>
+                            <code>tel|nom prenom|date|email|adresse|ville (code)|iban|swift</code><br><br>
+                            <strong>Exemple:</strong><br>
+                            <code>0669290606|Islam Soussi|01/09/1976|email@gmail.com|2 Avenue|Paris (75001)|FR76...|AGRIFRPP839</code>
+                        </div>
+                        
+                        <div id="format-excel" style="display: none;">
+                            <strong>Format Excel (.xls ou .xlsx):</strong><br>
+                            • Première ligne = En-têtes de colonnes<br>
+                            • Colonnes détectées automatiquement<br>
+                            • Colonnes attendues: Telephone, Nom, Prenom, Email, Adresse, Ville, Code_Postal, IBAN, SWIFT, Date_Naissance<br>
+                            • L'ordre des colonnes n'a pas d'importance<br>
+                            • Les noms de colonnes sont flexibles (ex: "Tel", "Téléphone", "Phone" = OK)<br><br>
+                            <strong>✅ Avantages Excel:</strong><br>
+                            • Détection automatique des colonnes<br>
+                            • Pas besoin de format spécifique<br>
+                            • Compatible avec vos exports existants
+                        </div>
+                        
+                        <br>
                         <strong>⚡ Performance:</strong> 500+ clients en < 1 seconde<br>
                         <strong>🏦 Détection:</strong> {{ total_banks }} banques dont {{ ca_caisses }} CA<br>
                         <strong>📊 Groupement:</strong> Téléchargement automatique par banque
                     </div>
-                    <input type="file" name="file" accept=".txt" required id="fileInput">
+                    <input type="file" name="file" accept=".txt,.xls,.xlsx" required id="fileInput">
                     <br>
-                    <button type="submit" class="btn btn-success">⚡ Charger fichier (ULTRA-RAPIDE)</button>
+                    <button type="submit" class="btn btn-success">⚡ Charger fichier (TXT ou Excel)</button>
                 </form>
                 <div id="uploadProgress" style="display:none;">
                     <div class="progress-bar">
@@ -1179,7 +1322,7 @@ def home():
             <h3>🔧 Actions</h3>
             <div style="margin: 20px 0;">
                 <a href="/clients" class="btn btn-primary">👥 Clients</a>
-                <a href="/banks" class="btn btn-info">🏦 Banques</a>
+                <a href="/banks" class="btn btn-primary">🏦 Banques</a>
                 <a href="/test-telegram" class="btn btn-success">📧 Test</a>
                 <a href="/health" class="btn btn-primary">🔍 Status</a>
                 <a href="/fix-webhook" class="btn btn-success">🔧 Webhook</a>
@@ -1187,31 +1330,58 @@ def home():
                 <a href="/clear" class="btn btn-danger" onclick="return confirm('Vider toute la base de données?')">🗑️ Vider</a>
             </div>
             
-            <div class="config-box">
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0;">
                 <h3>🔗 URL Webhook OVH</h3>
-                <code>{{ webhook_url }}/webhook/ovh?caller=*CALLING*&callee=*CALLED*&type=*EVENT*</code>
+                <code style="background: white; padding: 10px; display: block; border-radius: 5px; word-break: break-all;">{{ webhook_url }}/webhook/ovh?caller=*CALLING*&callee=*CALLED*&type=*EVENT*</code>
             </div>
             
-            <div class="config-box">
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0;">
                 <h3>📱 Commandes Telegram</h3>
-                <code>/numero 0669290606</code> - Fiche client<br>
-                <code>/iban FR76...</code> - Détection banque ({{ total_banks }} banques)<br>
-                <code>/stats</code> - Statistiques complètes
+                <code style="background: white; padding: 10px; display: block; border-radius: 5px;">/numero 0669290606</code> - Fiche client<br><br>
+                <code style="background: white; padding: 10px; display: block; border-radius: 5px;">/iban FR76...</code> - Détection banque ({{ total_banks }} banques)<br><br>
+                <code style="background: white; padding: 10px; display: block; border-radius: 5px;">/stats</code> - Statistiques complètes
             </div>
         </div>
     </div>
     
     <script>
+        function showFormat(format) {
+            // Cacher tous les formats
+            document.getElementById('format-txt').style.display = 'none';
+            document.getElementById('format-excel').style.display = 'none';
+            
+            // Retirer la classe active de tous les onglets
+            document.querySelectorAll('.format-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Afficher le format sélectionné
+            if (format === 'txt') {
+                document.getElementById('format-txt').style.display = 'block';
+                document.querySelectorAll('.format-tab')[0].classList.add('active');
+            } else {
+                document.getElementById('format-excel').style.display = 'block';
+                document.querySelectorAll('.format-tab')[1].classList.add('active');
+            }
+        }
+        
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
             e.preventDefault();
             
             const formData = new FormData(this);
             const progressDiv = document.getElementById('uploadProgress');
             const progressFill = document.getElementById('progressFill');
+            const fileInput = document.getElementById('fileInput');
+            const fileName = fileInput.files[0]?.name || '';
             
             progressDiv.style.display = 'block';
             progressFill.style.width = '30%';
-            progressFill.textContent = 'Chargement...';
+            
+            if (fileName.endsWith('.xls') || fileName.endsWith('.xlsx')) {
+                progressFill.textContent = 'Lecture Excel...';
+            } else {
+                progressFill.textContent = 'Chargement...';
+            }
             
             fetch('/upload', {
                 method: 'POST',
@@ -1223,7 +1393,7 @@ def home():
                 progressFill.textContent = '✅ Terminé!';
                 
                 if (data.status === 'success') {
-                    alert(`✅ ${data.clients} clients chargés avec succès!\n🏦 ${data.banks_detected} banques détectées\n📊 ${data.banks_grouped || '?'} banques groupées\n⚡ Temps: ${data.time || '< 1s'}`);
+                    alert(`✅ ${data.clients} clients chargés avec succès!\n🏦 ${data.banks_detected} banques détectées\n📊 ${data.banks_grouped || '?'} banques groupées\n⚡ Temps: ${data.time || '< 1s'}\n📄 Format: ${data.format || 'Détecté'}`);
                     setTimeout(() => location.reload(), 1500);
                 } else {
                     alert('❌ Erreur: ' + (data.error || 'Erreur inconnue'));
@@ -1263,12 +1433,26 @@ def upload_file():
             return jsonify({"error": "Aucun fichier"}), 400
         
         filename = secure_filename(file.filename)
-        if not filename.endswith('.txt'):
-            return jsonify({"error": "Fichier .txt uniquement"}), 400
+        file_ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+        
+        if file_ext not in Config.ALLOWED_EXTENSIONS:
+            return jsonify({"error": "Format non supporté. Utilisez .txt, .xls ou .xlsx"}), 400
         
         start_time = time.time()
-        content = file.read().decode('utf-8-sig')
-        nb = load_clients_from_pipe_file(content)
+        
+        # Détection du format et traitement
+        if file_ext in ['xls', 'xlsx']:
+            # Traitement Excel
+            logger.info(f"📊 Traitement fichier Excel: {filename}")
+            nb = load_clients_from_excel(file)
+            file_format = f"Excel ({file_ext.upper()})"
+        else:
+            # Traitement TXT
+            logger.info(f"📄 Traitement fichier TXT: {filename}")
+            content = file.read().decode('utf-8-sig')
+            nb = load_clients_from_pipe_file(content)
+            file_format = "TXT (Pipe)"
+        
         elapsed = time.time() - start_time
         
         upload_stats["filename"] = filename
@@ -1279,15 +1463,12 @@ def upload_file():
             "banks_detected": upload_stats.get("banks_detected", 0),
             "banks_grouped": len(clients_by_bank),
             "time": f"{elapsed:.2f}s",
-            "message": f"✅ {nb} clients chargés en {elapsed:.2f}s - {upload_stats.get('banks_detected', 0)} banques détectées - {len(clients_by_bank)} banques groupées"
+            "format": file_format,
+            "message": f"✅ {nb} clients chargés depuis {file_format} en {elapsed:.2f}s - {upload_stats.get('banks_detected', 0)} banques détectées"
         })
     except Exception as e:
         logger.error(f"Erreur upload: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-# ===================================================================
-# NOUVELLES ROUTES POUR TÉLÉCHARGEMENT
-# ===================================================================
 
 @app.route('/download/all/<format_type>')
 def download_all_clients(format_type):
@@ -1344,7 +1525,6 @@ def banks_list():
             'download_csv': f"/download/bank/{bank_code}/csv"
         })
     
-    # Trier par nombre de clients décroissant
     bank_stats.sort(key=lambda x: x['count'], reverse=True)
     
     return jsonify({
@@ -1367,8 +1547,9 @@ def test_telegram():
     if not telegram_service:
         return jsonify({"error": "Non configuré"}), 400
     
-    msg = f"""⚡ Test Render.com OPTIMISÉ v2 - {datetime.now().strftime('%H:%M:%S')}
+    msg = f"""⚡ Test Render.com OPTIMISÉ v2 + Excel - {datetime.now().strftime('%H:%M:%S')}
 ✅ Chargement 500+ clients en < 1s
+📊 Support: TXT, XLS, XLSX
 🏦 Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses régionales
 💾 Total banques: {len(iban_detector.all_banks)} en base
 📊 Groupement: {len(clients_by_bank)} banques détectées"""
@@ -1401,13 +1582,14 @@ def fix_webhook():
 def health():
     return jsonify({
         "status": "healthy",
-        "platform": "Render.com ⚡ OPTIMISÉ v2",
+        "platform": "Render.com ⚡ OPTIMISÉ v2 + Excel",
         "chat_id": Config.CHAT_ID,
         "config_valid": config_valid,
         "clients": upload_stats["total_clients"],
         "banks_detected": upload_stats.get("banks_detected", 0),
         "banks_grouped": len(clients_by_bank),
         "keep_alive": "active",
+        "supported_formats": ["TXT", "XLS", "XLSX"],
         "iban_detector": {
             "total_banks": len(iban_detector.all_banks),
             "credit_agricole_caisses": len(iban_detector.codes_ca),
@@ -1422,6 +1604,8 @@ def health():
             "Détection banque locale instantanée",
             f"Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses",
             f"Total: {len(iban_detector.all_banks)} banques en base",
+            "Support Excel .xls et .xlsx",
+            "Détection automatique des colonnes Excel",
             "Pas d'appels API externes",
             "Traitement optimisé 500+ clients",
             "Temps chargement: < 1 seconde"
@@ -1446,15 +1630,12 @@ def stats():
     cities_count = {}
     
     for client in clients_database.values():
-        # Comptage banques
         bank = client.get('banque', 'N/A')
         banks_count[bank] = banks_count.get(bank, 0) + 1
         
-        # Comptage villes
         city = client.get('ville', 'N/A')
         cities_count[city] = cities_count.get(city, 0) + 1
     
-    # Top 10
     top_banks = sorted(banks_count.items(), key=lambda x: x[1], reverse=True)[:10]
     top_cities = sorted(cities_count.items(), key=lambda x: x[1], reverse=True)[:10]
     
@@ -1464,6 +1645,7 @@ def stats():
         "banks_grouped": len(clients_by_bank),
         "last_upload": upload_stats.get("last_upload"),
         "filename": upload_stats.get("filename"),
+        "supported_formats": ["TXT (pipe)", "Excel (.xls)", "Excel (.xlsx)"],
         "top_banks": [{"bank": b[0], "count": b[1]} for b in top_banks],
         "top_cities": [{"city": c[0], "count": c[1]} for c in top_cities],
         "iban_detector_stats": {
@@ -1477,7 +1659,7 @@ def stats():
             "available_banks": len(clients_by_bank),
             "formats": ["TXT", "CSV"]
         },
-        "platform": "Render.com ⚡ OPTIMISÉ v2"
+        "platform": "Render.com ⚡ OPTIMISÉ v2 + Excel"
     })
 
 @app.route('/clear')
@@ -1498,33 +1680,6 @@ def clear_database():
         "clients_remaining": 0
     })
 
-@app.route('/banks-detailed')
-def list_banks():
-    """Liste toutes les banques en base avec détails"""
-    bank_details = []
-    for bank_code, phones in clients_by_bank.items():
-        bank_name = iban_detector.all_banks.get(bank_code, f"Banque {bank_code}")
-        bank_details.append({
-            "code": bank_code,
-            "name": bank_name,
-            "clients_count": len(phones),
-            "download_txt": f"/download/bank/{bank_code}/txt",
-            "download_csv": f"/download/bank/{bank_code}/csv"
-        })
-    
-    # Trier par nombre de clients
-    bank_details.sort(key=lambda x: x['clients_count'], reverse=True)
-    
-    return jsonify({
-        "total_banks": len(clients_by_bank),
-        "total_clients": upload_stats["total_clients"],
-        "banks": bank_details
-    })
-
-# ===================================================================
-# ERROR HANDLERS
-# ===================================================================
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -1539,7 +1694,6 @@ def not_found(error):
             "/download/bank/<code>/txt",
             "/download/bank/<code>/csv",
             "/banks",
-            "/banks-detailed",
             "/clients",
             "/search/<phone>",
             "/stats",
@@ -1558,24 +1712,21 @@ def internal_error(error):
         "message": str(error)
     }), 500
 
-# ===================================================================
-# DÉMARRAGE
-# ===================================================================
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     logger.info("=" * 60)
-    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION OPTIMISÉE v2")
+    logger.info("⚡ DÉMARRAGE RENDER.COM - VERSION OPTIMISÉE v2 + EXCEL")
     logger.info("=" * 60)
     logger.info(f"📱 Chat ID: {Config.CHAT_ID}")
     logger.info(f"📞 Ligne OVH: {Config.OVH_LINE_NUMBER}")
     logger.info(f"🔄 Keep-alive: Actif")
+    logger.info(f"📊 Formats supportés: TXT, XLS, XLSX")
     logger.info(f"⚡ Optimisations: ACTIVES")
     logger.info(f"   • Détection banque locale instantanée")
     logger.info(f"   • Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses")
     logger.info(f"   • Total banques: {len(iban_detector.all_banks)}")
-    logger.info(f"   • Pas d'appels API externes")
+    logger.info(f"   • Support Excel avec détection auto des colonnes")
     logger.info(f"   • Chargement 500+ clients en < 1s")
     logger.info(f"   • Téléchargement par banque: ACTIVÉ")
     logger.info("=" * 60)
