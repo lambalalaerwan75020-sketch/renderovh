@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
 import os
 import re
 import requests
@@ -8,6 +8,9 @@ from werkzeug.utils import secure_filename
 from functools import wraps
 import logging
 import threading
+import io
+import csv
+from collections import defaultdict
 
 # ===================================================================
 # CONFIGURATION ET LOGGING
@@ -329,6 +332,17 @@ class IBANDetector:
             return "N/A"
         
         return self.detect_local(iban_clean)
+    
+    def extract_bank_code(self, iban):
+        """Extrait le code banque de l'IBAN"""
+        if not iban:
+            return "unknown"
+        
+        iban_clean = self.clean_iban(iban)
+        if len(iban_clean) < 14 or not iban_clean.startswith('FR'):
+            return "unknown"
+        
+        return iban_clean[4:9]
 
 iban_detector = IBANDetector()
 
@@ -417,6 +431,7 @@ initialize_telegram_service()
 # ===================================================================
 
 clients_database = {}
+clients_by_bank = defaultdict(list)  # Nouveau: clients groupés par banque
 upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0}
 
 def normalize_phone(phone):
@@ -456,8 +471,9 @@ def get_client_info(phone_number):
 
 def load_clients_from_pipe_file(file_content):
     """Charge les clients depuis le format pipe (|) - OPTIMISÉ POUR 500+ CLIENTS"""
-    global clients_database, upload_stats
+    global clients_database, clients_by_bank, upload_stats
     clients_database = {}
+    clients_by_bank = defaultdict(list)  # Réinitialiser le groupement par banque
     
     try:
         lines = file_content.strip().split('\n')
@@ -523,11 +539,13 @@ def load_clients_from_pipe_file(file_content):
                     code_postal = ''
                 
                 # Détection banque LOCALE avec base étendue + DIAGNOSTIC
+                bank_code = "unknown"
                 if not iban or iban == '':
                     banque = 'N/A'
                     stats_diagnostic['iban_vide'] += 1
                 else:
                     iban_clean = iban_detector.clean_iban(iban)
+                    bank_code = iban_detector.extract_bank_code(iban)
                     
                     # Vérification format IBAN
                     if len(iban_clean) < 14 or not iban_clean.startswith('FR'):
@@ -539,27 +557,27 @@ def load_clients_from_pipe_file(file_content):
                             stats_diagnostic['iban_invalide'] += 1
                     else:
                         # Extraction du code banque
-                        code_banque = iban_clean[4:9]
-                        banque_detectee = iban_detector.all_banks.get(code_banque)
+                        banque_detectee = iban_detector.all_banks.get(bank_code)
                         
                         if banque_detectee:
                             # Banque détectée avec succès
                             banks_detected += 1
                             
                             # Statistique détaillée
-                            if code_banque in iban_detector.codes_ca:
+                            if bank_code in iban_detector.codes_ca:
                                 stats_diagnostic['code_ca_detecte'] += 1
                             else:
                                 stats_diagnostic['autres_banques'] += 1
                         else:
                             # Code banque inconnu
-                            banque_detectee = f"Banque française ({code_banque})"
+                            banque_detectee = f"Banque française ({bank_code})"
                             stats_diagnostic['code_inconnu'] += 1
-                            stats_diagnostic['codes_manquants'].add(code_banque)
+                            stats_diagnostic['codes_manquants'].add(bank_code)
                     
                     banque = f"🏦 {banque_detectee}"
                 
-                clients_database[telephone] = {
+                # Création du client
+                client_data = {
                     "nom": nom,
                     "prenom": prenom,
                     "email": email,
@@ -569,6 +587,7 @@ def load_clients_from_pipe_file(file_content):
                     "ville": ville,
                     "code_postal": code_postal,
                     "banque": banque,
+                    "bank_code": bank_code,  # Stocker le code banque
                     "swift": swift,
                     "iban": iban,
                     "sexe": "N/A",
@@ -581,6 +600,12 @@ def load_clients_from_pipe_file(file_content):
                     "dernier_appel": None,
                     "notes": ""
                 }
+                
+                clients_database[telephone] = client_data
+                
+                # Ajouter au groupement par banque
+                clients_by_bank[bank_code].append(telephone)
+                
                 loaded_count += 1
                 
             except Exception:
@@ -593,6 +618,7 @@ def load_clients_from_pipe_file(file_content):
         
         logger.info(f"✅ {loaded_count} clients chargés en {elapsed:.2f}s")
         logger.info(f"🏦 {banks_detected} banques identifiées précisément")
+        logger.info(f"📊 Groupement par banque: {len(clients_by_bank)} banques différentes")
         
         return loaded_count
         
@@ -605,7 +631,7 @@ def create_unknown_client(phone_number):
         "nom": "INCONNU", "prenom": "CLIENT", "email": "N/A",
         "entreprise": "N/A", "adresse": "N/A", "ville": "N/A",
         "code_postal": "N/A", "telephone": phone_number,
-        "banque": "N/A", "swift": "N/A", "iban": "N/A",
+        "banque": "N/A", "bank_code": "unknown", "swift": "N/A", "iban": "N/A",
         "sexe": "N/A", "date_naissance": "N/A", "lieu_naissance": "N/A",
         "profession": "N/A", "statut": "Non référencé",
         "date_upload": "N/A", "nb_appels": 0, "dernier_appel": None, "notes": ""
@@ -637,7 +663,8 @@ def process_telegram_command(message_text, chat_id):
 📅 Upload: {upload_stats['last_upload'] or 'Aucun'}
 📞 Ligne: {Config.OVH_LINE_NUMBER}
 🌐 Plateforme: Render.com ⚡ OPTIMISÉ
-💾 Base CA complète: {len(iban_detector.codes_ca)} caisses régionales"""
+💾 Base CA complète: {len(iban_detector.codes_ca)} caisses régionales
+📊 Groupement: {len(clients_by_bank)} banques différentes"""
             telegram_service.send_message(msg)
             return {"status": "ok", "command": "stats"}
         
@@ -645,6 +672,121 @@ def process_telegram_command(message_text, chat_id):
         
     except Exception as e:
         return {"error": str(e)}
+
+# ===================================================================
+# FONCTIONS POUR TÉLÉCHARGEMENT PAR BANQUE
+# ===================================================================
+
+def generate_bank_file(bank_code, format_type='txt'):
+    """Génère un fichier pour une banque spécifique"""
+    if bank_code not in clients_by_bank:
+        return None
+    
+    bank_name = iban_detector.all_banks.get(bank_code, f"Banque_{bank_code}")
+    client_phones = clients_by_bank[bank_code]
+    
+    if format_type == 'txt':
+        # Format pipe délimité
+        lines = []
+        for phone in client_phones:
+            client = clients_database[phone]
+            line = "|".join([
+                client['telephone'],
+                f"{client['nom']} {client['prenom']}",
+                client['date_naissance'],
+                client['email'],
+                client['adresse'],
+                f"{client['ville']} ({client['code_postal']})",
+                client['iban'],
+                client['swift']
+            ])
+            lines.append(line)
+        
+        content = "\n".join(lines)
+        filename = f"clients_{bank_name.replace(' ', '_')}_{bank_code}.txt"
+        return content, filename, 'text/plain'
+    
+    elif format_type == 'csv':
+        # Format CSV
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';')
+        
+        # En-tête
+        writer.writerow(['Telephone', 'Nom', 'Prenom', 'Date_Naissance', 'Email', 
+                        'Adresse', 'Ville', 'Code_Postal', 'IBAN', 'SWIFT'])
+        
+        # Données
+        for phone in client_phones:
+            client = clients_database[phone]
+            writer.writerow([
+                client['telephone'],
+                client['nom'],
+                client['prenom'],
+                client['date_naissance'],
+                client['email'],
+                client['adresse'],
+                client['ville'],
+                client['code_postal'],
+                client['iban'],
+                client['swift']
+            ])
+        
+        content = output.getvalue()
+        filename = f"clients_{bank_name.replace(' ', '_')}_{bank_code}.csv"
+        return content, filename, 'text/csv'
+    
+    return None
+
+def generate_all_clients_file(format_type='txt'):
+    """Génère un fichier avec tous les clients"""
+    if format_type == 'txt':
+        lines = []
+        for phone, client in clients_database.items():
+            line = "|".join([
+                client['telephone'],
+                f"{client['nom']} {client['prenom']}",
+                client['date_naissance'],
+                client['email'],
+                client['adresse'],
+                f"{client['ville']} ({client['code_postal']})",
+                client['iban'],
+                client['swift']
+            ])
+            lines.append(line)
+        
+        content = "\n".join(lines)
+        filename = f"tous_les_clients_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        return content, filename, 'text/plain'
+    
+    elif format_type == 'csv':
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';')
+        
+        # En-tête
+        writer.writerow(['Telephone', 'Nom', 'Prenom', 'Date_Naissance', 'Email', 
+                        'Adresse', 'Ville', 'Code_Postal', 'IBAN', 'SWIFT', 'Banque'])
+        
+        # Données
+        for phone, client in clients_database.items():
+            writer.writerow([
+                client['telephone'],
+                client['nom'],
+                client['prenom'],
+                client['date_naissance'],
+                client['email'],
+                client['adresse'],
+                client['ville'],
+                client['code_postal'],
+                client['iban'],
+                client['swift'],
+                client['banque']
+            ])
+        
+        content = output.getvalue()
+        filename = f"tous_les_clients_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        return content, filename, 'text/csv'
+    
+    return None
 
 # ===================================================================
 # ROUTES
@@ -701,12 +843,28 @@ def ping():
         "timestamp": datetime.now().isoformat(),
         "platform": "Render.com ⚡",
         "clients": upload_stats["total_clients"],
-        "banks_detected": upload_stats.get("banks_detected", 0)
+        "banks_detected": upload_stats.get("banks_detected", 0),
+        "banks_grouped": len(clients_by_bank)
     })
 
 @app.route('/')
 def home():
     auto_detected = upload_stats.get("banks_detected", 0)
+    
+    # Préparer les statistiques par banque pour l'affichage
+    bank_stats = []
+    for bank_code, phones in clients_by_bank.items():
+        bank_name = iban_detector.all_banks.get(bank_code, f"Banque {bank_code}")
+        bank_stats.append({
+            'code': bank_code,
+            'name': bank_name,
+            'count': len(phones),
+            'download_txt': f"/download/bank/{bank_code}/txt",
+            'download_csv': f"/download/bank/{bank_code}/csv"
+        })
+    
+    # Trier par nombre de clients décroissant
+    bank_stats.sort(key=lambda x: x['count'], reverse=True)
     
     return render_template_string("""
 <!DOCTYPE html>
@@ -714,7 +872,7 @@ def home():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ Webhook Render OPTIMISÉ v2</title>
+    <title>⚡ Webhook Render OPTIMISÉ v2 - Téléchargement par Banque</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -724,7 +882,7 @@ def home():
             padding: 20px;
         }
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
             background: white;
             border-radius: 15px;
@@ -775,7 +933,7 @@ def home():
         .stat-card .value { font-size: 2.5em; font-weight: bold; }
         .btn {
             display: inline-block;
-            padding: 14px 24px;
+            padding: 12px 20px;
             border-radius: 8px;
             text-decoration: none;
             margin: 5px;
@@ -784,10 +942,13 @@ def home():
             color: white;
             border: none;
             cursor: pointer;
+            font-size: 0.9em;
         }
         .btn-primary { background: #667eea; }
         .btn-success { background: #28a745; }
         .btn-danger { background: #dc3545; }
+        .btn-warning { background: #ffc107; color: black; }
+        .btn-info { background: #0dcaf0; }
         .btn:hover { transform: translateY(-2px); opacity: 0.9; }
         .upload-section {
             background: #f8f9fa;
@@ -836,6 +997,63 @@ def home():
             color: white;
             font-weight: bold;
         }
+        .banks-section {
+            margin: 30px 0;
+        }
+        .banks-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .bank-card {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+        .bank-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 20px rgba(0,0,0,0.15);
+        }
+        .bank-name {
+            font-weight: bold;
+            font-size: 1.1em;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        .bank-code {
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 15px;
+        }
+        .bank-count {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+        .bank-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .download-all {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 12px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .section-title {
+            font-size: 1.5em;
+            margin: 30px 0 20px 0;
+            color: #333;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
     </style>
 </head>
 <body>
@@ -845,7 +1063,7 @@ def home():
             <div class="badge">Chat ID: {{ chat_id }}</div>
             <div class="badge success">✅ Keep-Alive Actif</div>
             <div class="badge success">⚡ ULTRA-RAPIDE</div>
-            <div class="badge success">🏦 CA Complet</div>
+            <div class="badge success">🏦 Téléchargement par Banque</div>
         </div>
         
         <div class="content">
@@ -857,7 +1075,8 @@ def home():
                 Ligne OVH: {{ ovh_line }}<br>
                 🔄 Système anti-sleep: Actif<br>
                 ⚡ Chargement 500+ clients: < 1 seconde<br>
-                🏦 Base Crédit Agricole: {{ ca_caisses }} caisses régionales
+                🏦 Base Crédit Agricole: {{ ca_caisses }} caisses régionales<br>
+                📊 Groupement: {{ banks_count }} banques détectées
             </div>
             {% else %}
             <div class="alert alert-error">
@@ -873,7 +1092,8 @@ def home():
                 ✅ {{ total_banks }} banques en base<br>
                 ✅ Pas d'appels API externes pendant le chargement<br>
                 ✅ Traitement optimisé pour 500+ clients<br>
-                ✅ Temps de chargement: < 1 seconde
+                ✅ Temps de chargement: < 1 seconde<br>
+                ✅ Téléchargement par banque: TXT et CSV
             </div>
             
             <div class="stats-grid">
@@ -886,9 +1106,50 @@ def home():
                     <div class="value">{{ auto_detected }}</div>
                 </div>
                 <div class="stat-card">
+                    <h3>📊 Banques groupées</h3>
+                    <div class="value">{{ banks_count }}</div>
+                </div>
+                <div class="stat-card">
                     <h3>📅 Dernier upload</h3>
                     <div class="value" style="font-size:1.2em;">{{ last_upload or 'Aucun' }}</div>
                 </div>
+            </div>
+            
+            <!-- Section Téléchargement Global -->
+            <div class="download-all">
+                <h2>📥 Téléchargement Global</h2>
+                <p>Téléchargez tous les clients en un seul fichier</p>
+                <div style="margin: 20px 0;">
+                    <a href="/download/all/txt" class="btn btn-success">📄 Télécharger TXT ({{ total_clients }} clients)</a>
+                    <a href="/download/all/csv" class="btn btn-primary">📊 Télécharger CSV ({{ total_clients }} clients)</a>
+                </div>
+            </div>
+            
+            <!-- Section Banques -->
+            <div class="banks-section">
+                <h2 class="section-title">🏦 Téléchargement par Banque</h2>
+                <p>Sélectionnez une banque pour télécharger ses clients</p>
+                
+                <div class="banks-grid">
+                    {% for bank in bank_stats %}
+                    <div class="bank-card">
+                        <div class="bank-name">{{ bank.name }}</div>
+                        <div class="bank-code">Code: {{ bank.code }}</div>
+                        <div class="bank-count">{{ bank.count }} clients</div>
+                        <div class="bank-actions">
+                            <a href="{{ bank.download_txt }}" class="btn btn-success">📄 TXT</a>
+                            <a href="{{ bank.download_csv }}" class="btn btn-primary">📊 CSV</a>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                
+                {% if not bank_stats %}
+                <div class="alert alert-info">
+                    <strong>ℹ️ Aucune banque détectée</strong><br>
+                    Uploader un fichier de clients pour voir les banques groupées
+                </div>
+                {% endif %}
             </div>
             
             <div class="upload-section">
@@ -901,7 +1162,8 @@ def home():
                         <strong>Exemple:</strong><br>
                         <code>0669290606|Islam Soussi|01/09/1976|email@gmail.com|2 Avenue|Paris (75001)|FR76...|AGRIFRPP839</code><br><br>
                         <strong>⚡ Performance:</strong> 500+ clients en < 1 seconde<br>
-                        <strong>🏦 Détection:</strong> {{ total_banks }} banques dont {{ ca_caisses }} CA
+                        <strong>🏦 Détection:</strong> {{ total_banks }} banques dont {{ ca_caisses }} CA<br>
+                        <strong>📊 Groupement:</strong> Téléchargement automatique par banque
                     </div>
                     <input type="file" name="file" accept=".txt" required id="fileInput">
                     <br>
@@ -917,10 +1179,12 @@ def home():
             <h3>🔧 Actions</h3>
             <div style="margin: 20px 0;">
                 <a href="/clients" class="btn btn-primary">👥 Clients</a>
+                <a href="/banks" class="btn btn-info">🏦 Banques</a>
                 <a href="/test-telegram" class="btn btn-success">📧 Test</a>
                 <a href="/health" class="btn btn-primary">🔍 Status</a>
                 <a href="/fix-webhook" class="btn btn-success">🔧 Webhook</a>
                 <a href="/ping" class="btn btn-primary">🔄 Ping</a>
+                <a href="/clear" class="btn btn-danger" onclick="return confirm('Vider toute la base de données?')">🗑️ Vider</a>
             </div>
             
             <div class="config-box">
@@ -959,7 +1223,7 @@ def home():
                 progressFill.textContent = '✅ Terminé!';
                 
                 if (data.status === 'success') {
-                    alert(`✅ ${data.clients} clients chargés avec succès!\n🏦 ${data.banks_detected} banques détectées\n⚡ Temps: ${data.time || '< 1s'}`);
+                    alert(`✅ ${data.clients} clients chargés avec succès!\n🏦 ${data.banks_detected} banques détectées\n📊 ${data.banks_grouped || '?'} banques groupées\n⚡ Temps: ${data.time || '< 1s'}`);
                     setTimeout(() => location.reload(), 1500);
                 } else {
                     alert('❌ Erreur: ' + (data.error || 'Erreur inconnue'));
@@ -983,7 +1247,9 @@ def home():
     ovh_line=Config.OVH_LINE_NUMBER,
     webhook_url=request.url_root.rstrip('/'),
     ca_caisses=len(iban_detector.codes_ca),
-    total_banks=len(iban_detector.all_banks)
+    total_banks=len(iban_detector.all_banks),
+    banks_count=len(clients_by_bank),
+    bank_stats=bank_stats
     )
 
 @app.route('/upload', methods=['POST'])
@@ -1011,12 +1277,81 @@ def upload_file():
             "status": "success", 
             "clients": nb,
             "banks_detected": upload_stats.get("banks_detected", 0),
+            "banks_grouped": len(clients_by_bank),
             "time": f"{elapsed:.2f}s",
-            "message": f"✅ {nb} clients chargés en {elapsed:.2f}s - {upload_stats.get('banks_detected', 0)} banques détectées"
+            "message": f"✅ {nb} clients chargés en {elapsed:.2f}s - {upload_stats.get('banks_detected', 0)} banques détectées - {len(clients_by_bank)} banques groupées"
         })
     except Exception as e:
         logger.error(f"Erreur upload: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+# ===================================================================
+# NOUVELLES ROUTES POUR TÉLÉCHARGEMENT
+# ===================================================================
+
+@app.route('/download/all/<format_type>')
+def download_all_clients(format_type):
+    """Télécharge tous les clients"""
+    if format_type not in ['txt', 'csv']:
+        return jsonify({"error": "Format non supporté"}), 400
+    
+    result = generate_all_clients_file(format_type)
+    if not result:
+        return jsonify({"error": "Erreur génération fichier"}), 500
+    
+    content, filename, mimetype = result
+    
+    return send_file(
+        io.BytesIO(content.encode('utf-8')),
+        as_attachment=True,
+        download_name=filename,
+        mimetype=mimetype
+    )
+
+@app.route('/download/bank/<bank_code>/<format_type>')
+def download_bank_clients(bank_code, format_type):
+    """Télécharge les clients d'une banque spécifique"""
+    if format_type not in ['txt', 'csv']:
+        return jsonify({"error": "Format non supporté"}), 400
+    
+    if bank_code not in clients_by_bank:
+        return jsonify({"error": "Banque non trouvée"}), 404
+    
+    result = generate_bank_file(bank_code, format_type)
+    if not result:
+        return jsonify({"error": "Erreur génération fichier"}), 500
+    
+    content, filename, mimetype = result
+    
+    return send_file(
+        io.BytesIO(content.encode('utf-8')),
+        as_attachment=True,
+        download_name=filename,
+        mimetype=mimetype
+    )
+
+@app.route('/banks')
+def banks_list():
+    """Liste toutes les banques avec statistiques"""
+    bank_stats = []
+    for bank_code, phones in clients_by_bank.items():
+        bank_name = iban_detector.all_banks.get(bank_code, f"Banque {bank_code}")
+        bank_stats.append({
+            'code': bank_code,
+            'name': bank_name,
+            'count': len(phones),
+            'download_txt': f"/download/bank/{bank_code}/txt",
+            'download_csv': f"/download/bank/{bank_code}/csv"
+        })
+    
+    # Trier par nombre de clients décroissant
+    bank_stats.sort(key=lambda x: x['count'], reverse=True)
+    
+    return jsonify({
+        "total_banks": len(clients_by_bank),
+        "total_clients": upload_stats["total_clients"],
+        "banks": bank_stats
+    })
 
 @app.route('/clients')
 def clients():
@@ -1035,7 +1370,8 @@ def test_telegram():
     msg = f"""⚡ Test Render.com OPTIMISÉ v2 - {datetime.now().strftime('%H:%M:%S')}
 ✅ Chargement 500+ clients en < 1s
 🏦 Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses régionales
-💾 Total banques: {len(iban_detector.all_banks)} en base"""
+💾 Total banques: {len(iban_detector.all_banks)} en base
+📊 Groupement: {len(clients_by_bank)} banques détectées"""
     
     result = telegram_service.send_message(msg)
     return jsonify({"status": "success" if result else "error"})
@@ -1070,12 +1406,18 @@ def health():
         "config_valid": config_valid,
         "clients": upload_stats["total_clients"],
         "banks_detected": upload_stats.get("banks_detected", 0),
+        "banks_grouped": len(clients_by_bank),
         "keep_alive": "active",
         "iban_detector": {
             "total_banks": len(iban_detector.all_banks),
             "credit_agricole_caisses": len(iban_detector.codes_ca),
             "other_banks": len(iban_detector.local_banks)
         },
+        "download_features": [
+            "Téléchargement global TXT/CSV",
+            "Téléchargement par banque TXT/CSV",
+            f"{len(clients_by_bank)} banques disponibles"
+        ],
         "optimizations": [
             "Détection banque locale instantanée",
             f"Base Crédit Agricole: {len(iban_detector.codes_ca)} caisses",
@@ -1119,6 +1461,7 @@ def stats():
     return jsonify({
         "total_clients": len(clients_database),
         "banks_detected": upload_stats.get("banks_detected", 0),
+        "banks_grouped": len(clients_by_bank),
         "last_upload": upload_stats.get("last_upload"),
         "filename": upload_stats.get("filename"),
         "top_banks": [{"bank": b[0], "count": b[1]} for b in top_banks],
@@ -1128,16 +1471,23 @@ def stats():
             "credit_agricole_caisses": len(iban_detector.codes_ca),
             "other_banks": len(iban_detector.local_banks)
         },
+        "download_features": {
+            "global": True,
+            "by_bank": True,
+            "available_banks": len(clients_by_bank),
+            "formats": ["TXT", "CSV"]
+        },
         "platform": "Render.com ⚡ OPTIMISÉ v2"
     })
 
 @app.route('/clear')
 def clear_database():
     """Vider la base de données"""
-    global clients_database, upload_stats
+    global clients_database, clients_by_bank, upload_stats
     
     count = len(clients_database)
     clients_database = {}
+    clients_by_bank = defaultdict(list)
     upload_stats = {"total_clients": 0, "last_upload": None, "filename": None, "banks_detected": 0}
     
     logger.info(f"🗑️ Base de données vidée ({count} clients supprimés)")
@@ -1148,20 +1498,27 @@ def clear_database():
         "clients_remaining": 0
     })
 
-@app.route('/banks')
+@app.route('/banks-detailed')
 def list_banks():
-    """Liste toutes les banques en base"""
+    """Liste toutes les banques en base avec détails"""
+    bank_details = []
+    for bank_code, phones in clients_by_bank.items():
+        bank_name = iban_detector.all_banks.get(bank_code, f"Banque {bank_code}")
+        bank_details.append({
+            "code": bank_code,
+            "name": bank_name,
+            "clients_count": len(phones),
+            "download_txt": f"/download/bank/{bank_code}/txt",
+            "download_csv": f"/download/bank/{bank_code}/csv"
+        })
+    
+    # Trier par nombre de clients
+    bank_details.sort(key=lambda x: x['clients_count'], reverse=True)
+    
     return jsonify({
-        "total_banks": len(iban_detector.all_banks),
-        "credit_agricole": {
-            "count": len(iban_detector.codes_ca),
-            "caisses": list(iban_detector.codes_ca.values())
-        },
-        "other_banks": {
-            "count": len(iban_detector.local_banks),
-            "banks": list(iban_detector.local_banks.values())
-        },
-        "all_codes": iban_detector.all_banks
+        "total_banks": len(clients_by_bank),
+        "total_clients": upload_stats["total_clients"],
+        "banks": bank_details
     })
 
 # ===================================================================
@@ -1177,10 +1534,15 @@ def not_found(error):
             "/webhook/ovh",
             "/webhook/telegram",
             "/upload",
+            "/download/all/txt",
+            "/download/all/csv",
+            "/download/bank/<code>/txt",
+            "/download/bank/<code>/csv",
+            "/banks",
+            "/banks-detailed",
             "/clients",
             "/search/<phone>",
             "/stats",
-            "/banks",
             "/test-telegram",
             "/fix-webhook",
             "/health",
@@ -1215,6 +1577,7 @@ if __name__ == '__main__':
     logger.info(f"   • Total banques: {len(iban_detector.all_banks)}")
     logger.info(f"   • Pas d'appels API externes")
     logger.info(f"   • Chargement 500+ clients en < 1s")
+    logger.info(f"   • Téléchargement par banque: ACTIVÉ")
     logger.info("=" * 60)
     
     is_valid, missing = check_required_config()
